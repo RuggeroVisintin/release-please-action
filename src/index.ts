@@ -230,3 +230,4 @@ if (require.main === module) {
     core.setFailed(`release-please failed: ${err.message}`)
   })
 }
+// trigger release

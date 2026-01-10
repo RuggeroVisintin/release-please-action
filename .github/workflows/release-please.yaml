@@ -69,9 +69,9 @@ jobs:
       - release-please-release
     steps:
       - id: release-pr
-        uses: googleapis/release-please-action@main
+        uses: RuggeroVisintin/release-please-action@main
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           release-type: node
-          fork: true
+          fork: false
           skip-github-release: true

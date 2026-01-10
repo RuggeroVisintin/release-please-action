@@ -26,7 +26,7 @@ jobs:
       with:
         command: pr
         upstream_repo: release-please-action
-        upstream_owner: googleapis
+        upstream_owner: RuggeroVisintin
         description: Build dist
         title: "chore: build dist"
         message: "chore: build dist"
@@ -34,7 +34,7 @@ jobs:
         branch: build-dist
         force: true
         git_dir: .
-        fork: true
+        fork: false
       env:
         ACCESS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   release-please-release:

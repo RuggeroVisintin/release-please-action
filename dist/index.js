@@ -106160,6 +106160,7 @@ var exports = __webpack_exports__;
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+var _a;
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.main = void 0;
 const core = __nccwpck_require__(42186);
@@ -106325,7 +106326,9 @@ function outputPRs(prs) {
         core.setOutput('prs', JSON.stringify(prs));
     }
 }
-if (require.main === require.cache[eval('__filename')]) {
+const isDirectExecution = require.main === require.cache[eval('__filename')] ||
+    require.main === ((_a = require.cache) === null || _a === void 0 ? void 0 : _a[__filename]);
+if (isDirectExecution || process.env.GITHUB_ACTIONS === 'true') {
     main().catch(err => {
         core.setFailed(`release-please failed: ${err.message}`);
     });

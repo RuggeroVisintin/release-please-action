@@ -225,7 +225,11 @@ function outputPRs(prs: (PullRequest | undefined)[]) {
   }
 }
 
-if (require.main === module) {
+const isDirectExecution =
+  require.main === module ||
+  require.main === require.cache?.[__filename];
+
+if (isDirectExecution || process.env.GITHUB_ACTIONS === 'true') {
   main().catch(err => {
     core.setFailed(`release-please failed: ${err.message}`)
   })

@@ -50220,41 +50220,50 @@ class FeatureFlagPlugin extends plugin_1.ManifestPlugin {
         if (!owner || !repo || !octokit) {
             return this.findMergedPullRequestsWithFeatureFlagBodyFallback(maxResults);
         }
-        const query = `repo:${owner}/${repo} is:pr is:merged base:${this.targetBranch} in:body \"Feature-Flag:\"`;
+        const query = `repo:${owner}/${repo} is:pr is:merged base:${this.targetBranch} in:body "Feature-Flag:"`;
         const prs = [];
         let page = 1;
         const perPage = 100;
-        while (prs.length < maxResults) {
-            const response = await octokit.request('GET /search/issues', {
-                q: query,
-                per_page: perPage,
-                page,
-                sort: 'updated',
-                order: 'desc',
-            });
-            const items = ((_c = response === null || response === void 0 ? void 0 : response.data) === null || _c === void 0 ? void 0 : _c.items) || [];
-            if (items.length === 0) {
-                break;
-            }
-            for (const item of items) {
-                if (prs.length >= maxResults) {
+        console.log(`[FeatureFlagPlugin] Searching merged PRs with Feature-Flag overrides (branch=${this.targetBranch}, maxResults=${maxResults})`);
+        try {
+            while (prs.length < maxResults) {
+                const response = await octokit.request('GET /search/issues', {
+                    q: query,
+                    per_page: perPage,
+                    page,
+                    sort: 'updated',
+                    order: 'desc',
+                });
+                const items = ((_c = response === null || response === void 0 ? void 0 : response.data) === null || _c === void 0 ? void 0 : _c.items) || [];
+                console.log(`[FeatureFlagPlugin] Search page ${page}: ${items.length} candidate PRs`);
+                if (items.length === 0) {
                     break;
                 }
-                const number = item === null || item === void 0 ? void 0 : item.number;
-                if (!number) {
-                    continue;
+                for (const item of items) {
+                    if (prs.length >= maxResults) {
+                        break;
+                    }
+                    const number = item === null || item === void 0 ? void 0 : item.number;
+                    if (!number) {
+                        continue;
+                    }
+                    try {
+                        const pr = await this.github.getPullRequest(number);
+                        prs.push(pr);
+                    }
+                    catch (_d) {
+                        // Skip PRs that cannot be fetched for any reason.
+                    }
                 }
-                try {
-                    const pr = await this.github.getPullRequest(number);
-                    prs.push(pr);
-                }
-                catch (_d) {
-                    // Skip PRs that cannot be fetched for any reason.
-                }
+                page++;
             }
-            page++;
+            console.log(`[FeatureFlagPlugin] Search API returned ${prs.length} merged PRs with Feature-Flag in body`);
+            return prs;
         }
-        return prs;
+        catch (error) {
+            console.warn('[FeatureFlagPlugin] Search API failed, falling back to merged PR iterator:', error);
+            return this.findMergedPullRequestsWithFeatureFlagBodyFallback(maxResults);
+        }
     }
     /**
      * Fallback for environments where octokit is unavailable on the github object.
@@ -50266,6 +50275,7 @@ class FeatureFlagPlugin extends plugin_1.ManifestPlugin {
                 prs.push(pr);
             }
         }
+        console.log(`[FeatureFlagPlugin] Fallback iterator returned ${prs.length} merged PRs with Feature-Flag in body`);
         return prs;
     }
     /**

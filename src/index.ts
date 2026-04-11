@@ -13,7 +13,7 @@
 // limitations under the License.
 
 import * as core from '@actions/core';
-import {GitHub, Manifest, CreatedRelease, PullRequest, VERSION} from 'release-please';
+import { GitHub, Manifest, CreatedRelease, PullRequest, VERSION } from 'release-please';
 
 const DEFAULT_CONFIG_FILE = 'release-please-config.json';
 const DEFAULT_MANIFEST_FILE = '.release-please-manifest.json';
@@ -49,7 +49,7 @@ interface ActionInputs {
 
 function parseInputs(): ActionInputs {
   const inputs: ActionInputs = {
-    token: core.getInput('token', {required: true}),
+    token: core.getInput('token', { required: true }),
     releaseType: getOptionalInput('release-type'),
     path: getOptionalInput('path'),
     repoUrl: core.getInput('repo-url') || process.env.GITHUB_REPOSITORY || '',
@@ -110,9 +110,9 @@ function loadOrBuildManifest(
   }
   const manifestOverrides = inputs.fork || inputs.skipLabeling
     ? {
-        fork: inputs.fork,
-        skipLabeling: inputs.skipLabeling,
-      }
+      fork: inputs.fork,
+      skipLabeling: inputs.skipLabeling,
+    }
     : {};
   core.debug('Loading manifest from config file');
   return Manifest.fromManifest(

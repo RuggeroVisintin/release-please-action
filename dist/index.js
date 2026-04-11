@@ -45927,9 +45927,17 @@ class DefaultChangelogNotes {
             const notes = commit.notes
                 .filter(note => note.title === 'BREAKING CHANGE')
                 .map(note => replaceIssueLink(note, context.host, context.owner, context.repository));
+            let subject = htmlEscape(commit.bareMessage);
+            // Append author info if enabled and author is available
+            if (options.includeCommitAuthors && commit.author) {
+                const authorDisplay = commit.author.username
+                    ? `@${commit.author.username}`
+                    : commit.author.name;
+                subject = `${subject} (${authorDisplay})`;
+            }
             return {
                 body: '',
-                subject: htmlEscape(commit.bareMessage),
+                subject,
                 type: commit.type,
                 scope: commit.scope,
                 notes,
@@ -46847,6 +46855,714 @@ exports.getReleaserTypes = getReleaserTypes;
 
 /***/ }),
 
+/***/ 27485:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.sleepInMs = exports.wrapAsync = exports.GitHubApi = exports.MAX_ISSUE_BODY_SIZE = exports.MAX_SLEEP_SECONDS = exports.GH_GRAPHQL_URL = exports.GH_API_URL = void 0;
+const rest_1 = __nccwpck_require__(55375);
+const request_1 = __nccwpck_require__(36234);
+const request_error_1 = __nccwpck_require__(10537);
+const errors_1 = __nccwpck_require__(93637);
+const logger_1 = __nccwpck_require__(68809);
+const graphql_1 = __nccwpck_require__(88467);
+const https_proxy_agent_1 = __nccwpck_require__(77219);
+const http_proxy_agent_1 = __nccwpck_require__(23764);
+exports.GH_API_URL = 'https://api.github.com';
+exports.GH_GRAPHQL_URL = 'https://api.github.com';
+exports.MAX_SLEEP_SECONDS = 20;
+exports.MAX_ISSUE_BODY_SIZE = 65536;
+class GitHubApi {
+    constructor(options) {
+        var _a;
+        this.graphqlRequest = (0, exports.wrapAsync)(async (opts, options) => {
+            var _a;
+            let maxRetries = (_a = options === null || options === void 0 ? void 0 : options.maxRetries) !== null && _a !== void 0 ? _a : 5;
+            let seconds = 1;
+            while (maxRetries >= 0) {
+                try {
+                    const response = await this.graphql(opts);
+                    if (response) {
+                        return response;
+                    }
+                    this.logger.trace('no GraphQL response, retrying');
+                }
+                catch (err) {
+                    if (err.status !== 502) {
+                        throw err;
+                    }
+                    if (maxRetries === 0) {
+                        this.logger.warn('ran out of retries and response is required');
+                        throw err;
+                    }
+                    this.logger.info(`received 502 error, ${maxRetries} attempts remaining`);
+                }
+                maxRetries -= 1;
+                if (maxRetries >= 0) {
+                    this.logger.trace(`sleeping ${seconds} seconds`);
+                    await (0, exports.sleepInMs)(1000 * seconds);
+                    seconds = Math.min(seconds * 2, exports.MAX_SLEEP_SECONDS);
+                }
+            }
+            this.logger.trace('ran out of retries');
+            return undefined;
+        });
+        this.createPullRequest = (0, exports.wrapAsync)(async (pullRequest, targetBranch, options) => {
+            const pullResponseData = (await this.octokit.pulls.create({
+                owner: this.repository.owner,
+                repo: this.repository.repo,
+                title: pullRequest.title,
+                head: `${this.repository.owner}:${pullRequest.headBranchName}`,
+                base: targetBranch,
+                body: pullRequest.body,
+                maintainer_can_modify: true,
+                draft: !!(options === null || options === void 0 ? void 0 : options.draft),
+            })).data;
+            this.logger.info(`Successfully opened pull request available at url: ${pullResponseData.html_url}.`);
+            return await this.getPullRequest(pullResponseData.number);
+        });
+        /**
+         * Fetch a pull request given the pull number
+         * @param {number} number The pull request number
+         * @returns {PullRequest}
+         */
+        this.getPullRequest = (0, exports.wrapAsync)(async (number) => {
+            const response = await this.octokit.pulls.get({
+                owner: this.repository.owner,
+                repo: this.repository.repo,
+                pull_number: number,
+            });
+            return {
+                headBranchName: response.data.head.ref,
+                baseBranchName: response.data.base.ref,
+                number: response.data.number,
+                title: response.data.title,
+                body: response.data.body || '',
+                files: [],
+                labels: response.data.labels
+                    .map((label) => label.name)
+                    .filter((name) => !!name),
+            };
+        });
+        this.updatePullRequest = (0, exports.wrapAsync)(async (number, title, body) => {
+            const response = await this.octokit.pulls.update({
+                owner: this.repository.owner,
+                repo: this.repository.repo,
+                pull_number: number,
+                title,
+                body,
+                state: 'open',
+            });
+            return {
+                headBranchName: response.data.head.ref,
+                baseBranchName: response.data.base.ref,
+                number: response.data.number,
+                title: response.data.title,
+                body: response.data.body || '',
+                files: [],
+                labels: response.data.labels
+                    .map((label) => label.name)
+                    .filter((name) => !!name),
+            };
+        });
+        /**
+         * Create a GitHub release
+         *
+         * @param {Release} release Release parameters
+         * @param {ScmReleaseOptions} options Release option parameters
+         * @throws {DuplicateReleaseError} if the release tag already exists
+         * @throws {GitHubAPIError} on other API errors
+         */
+        this.createRelease = (0, exports.wrapAsync)(async (release, options = {}) => {
+            if (options.forceTag) {
+                try {
+                    await this.octokit.git.createRef({
+                        owner: this.repository.owner,
+                        repo: this.repository.repo,
+                        ref: `refs/tags/${release.tag.toString()}`,
+                        sha: release.sha,
+                    });
+                }
+                catch (err) {
+                    // ignore if tag already exists
+                    if (err.status === 422) {
+                        this.logger.debug(`Tag ${release.tag.toString()} already exists, skipping tag creation`);
+                    }
+                    else {
+                        throw err;
+                    }
+                }
+            }
+            const resp = await this.octokit.repos.createRelease({
+                name: release.name,
+                owner: this.repository.owner,
+                repo: this.repository.repo,
+                tag_name: release.tag.toString(),
+                body: release.notes,
+                draft: !!options.draft,
+                prerelease: !!options.prerelease,
+                target_commitish: release.sha,
+            });
+            return {
+                id: resp.data.id,
+                name: resp.data.name || undefined,
+                tagName: resp.data.tag_name,
+                sha: resp.data.target_commitish,
+                notes: resp.data.body_text ||
+                    resp.data.body ||
+                    resp.data.body_html ||
+                    undefined,
+                url: resp.data.html_url,
+                draft: resp.data.draft,
+                uploadUrl: resp.data.upload_url,
+            };
+        }, e => {
+            if (e instanceof request_error_1.RequestError) {
+                if (e.status === 422 &&
+                    errors_1.GitHubAPIError.parseErrors(e).some(error => {
+                        return error.code === 'already_exists';
+                    })) {
+                    throw new errors_1.DuplicateReleaseError(e, 'tagName');
+                }
+            }
+        });
+        /**
+         * Makes a comment on a issue/pull request.
+         *
+         * @param {string} comment - The body of the comment to post.
+         * @param {number} number - The issue or pull request number.
+         * @throws {GitHubAPIError} on an API error
+         */
+        this.commentOnIssue = (0, exports.wrapAsync)(async (comment, number) => {
+            this.logger.debug(`adding comment to https://github.com/${this.repository.owner}/${this.repository.repo}/issues/${number}`);
+            const resp = await this.octokit.issues.createComment({
+                owner: this.repository.owner,
+                repo: this.repository.repo,
+                issue_number: number,
+                body: comment,
+            });
+            return resp.data.html_url;
+        });
+        /**
+         * Removes labels from an issue/pull request.
+         *
+         * @param {string[]} labels The labels to remove.
+         * @param {number} number The issue/pull request number.
+         */
+        this.removeIssueLabels = (0, exports.wrapAsync)(async (labels, number) => {
+            if (labels.length === 0) {
+                return;
+            }
+            this.logger.debug(`removing labels: ${labels} from issue/pull ${number}`);
+            await Promise.all(labels.map(label => this.octokit.issues.removeLabel({
+                owner: this.repository.owner,
+                repo: this.repository.repo,
+                issue_number: number,
+                name: label,
+            })));
+        });
+        /**
+         * Adds label to an issue/pull request.
+         *
+         * @param {string[]} labels The labels to add.
+         * @param {number} number The issue/pull request number.
+         */
+        this.addIssueLabels = (0, exports.wrapAsync)(async (labels, number) => {
+            if (labels.length === 0) {
+                return;
+            }
+            this.logger.debug(`adding labels: ${labels} from issue/pull ${number}`);
+            await this.octokit.issues.addLabels({
+                owner: this.repository.owner,
+                repo: this.repository.repo,
+                issue_number: number,
+                labels,
+            });
+        });
+        this.repository = options.repository;
+        this.octokitAPIs = options.octokitAPIs;
+        this.octokit = options.octokitAPIs.octokit;
+        this.graphql = options.octokitAPIs.graphql;
+        this.logger = (_a = options.logger) !== null && _a !== void 0 ? _a : logger_1.logger;
+    }
+    static createDefaultAgent(baseUrl, defaultProxy) {
+        if (!defaultProxy) {
+            return undefined;
+        }
+        const { host, port } = defaultProxy;
+        if (new URL(baseUrl).protocol.replace(':', '') === 'http') {
+            return new http_proxy_agent_1.HttpProxyAgent(`http://${host}:${port}`);
+        }
+        else {
+            return new https_proxy_agent_1.HttpsProxyAgent(`https://${host}:${port}`);
+        }
+    }
+    static async create(options) {
+        var _a, _b, _c, _d;
+        const apiUrl = (_a = options.apiUrl) !== null && _a !== void 0 ? _a : exports.GH_API_URL;
+        const graphqlUrl = (_b = options.graphqlUrl) !== null && _b !== void 0 ? _b : exports.GH_GRAPHQL_URL;
+        const releasePleaseVersion = (__nccwpck_require__(40255)/* .version */ .i8);
+        const apis = (_c = options.octokitAPIs) !== null && _c !== void 0 ? _c : {
+            octokit: new rest_1.Octokit({
+                baseUrl: apiUrl,
+                auth: options.token,
+                request: {
+                    agent: this.createDefaultAgent(apiUrl, options.proxy),
+                    fetch: options.fetch,
+                },
+            }),
+            request: request_1.request.defaults({
+                baseUrl: apiUrl,
+                headers: {
+                    'user-agent': `release-please/${releasePleaseVersion}`,
+                    Authorization: `token ${options.token}`,
+                },
+                fetch: options.fetch,
+            }),
+            graphql: graphql_1.graphql.defaults({
+                baseUrl: graphqlUrl,
+                request: {
+                    agent: this.createDefaultAgent(graphqlUrl, options.proxy),
+                    fetch: options.fetch,
+                },
+                headers: {
+                    'user-agent': `release-please/${releasePleaseVersion}`,
+                    Authorization: `token ${options.token}`,
+                    'content-type': 'application/vnd.github.v3+json',
+                },
+            }),
+        };
+        const opts = {
+            repository: {
+                owner: options.owner,
+                repo: options.repo,
+                defaultBranch: (_d = options.defaultBranch) !== null && _d !== void 0 ? _d : (await GitHubApi.defaultBranch(options.owner, options.repo, apis.octokit)),
+            },
+            octokitAPIs: apis,
+            logger: options.logger,
+        };
+        return new GitHubApi(opts);
+    }
+    static async defaultBranch(owner, repo, octokit) {
+        const { data } = await octokit.repos.get({
+            repo,
+            owner,
+        });
+        return data.default_branch;
+    }
+    /**
+     * Iterate through merged pull requests with a max number of results scanned.
+     *
+     * @param {string} targetBranch Target branch of commit.
+     * @param {string} status The status of the pull request. Defaults to 'MERGED'.
+     * @param {number} maxResults Limit the number of results searched. Defaults to
+     *   unlimited.
+     * @param {boolean} includeFiles Whether to fetch the list of files included in
+     *   the pull request. Defaults to `true`.
+     * @yields {PullRequest}
+     * @throws {GitHubAPIError} on an API error
+     */
+    async *pullRequestIterator(targetBranch, status = 'MERGED', maxResults = Number.MAX_SAFE_INTEGER, includeFiles = true) {
+        const generator = includeFiles
+            ? this.pullRequestIteratorWithFiles(targetBranch, status, maxResults)
+            : this.pullRequestIteratorWithoutFiles(targetBranch, status, maxResults);
+        for await (const pullRequest of generator) {
+            yield pullRequest;
+        }
+    }
+    /**
+     * Helper implementation of pullRequestIterator that includes files via
+     * the graphQL API.
+     *
+     * @param {string} targetBranch The base branch of the pull request
+     * @param {string} status The status of the pull request
+     * @param {number} maxResults Limit the number of results searched
+     */
+    async *pullRequestIteratorWithFiles(targetBranch, status = 'MERGED', maxResults = Number.MAX_SAFE_INTEGER) {
+        let cursor = undefined;
+        let results = 0;
+        while (results < maxResults) {
+            const response = await this.pullRequestsGraphQL(targetBranch, status, cursor);
+            // no response usually means we ran out of results
+            if (!response) {
+                break;
+            }
+            for (let i = 0; i < response.data.length; i++) {
+                results += 1;
+                yield response.data[i];
+            }
+            if (!response.pageInfo.hasNextPage) {
+                break;
+            }
+            cursor = response.pageInfo.endCursor;
+        }
+    }
+    /**
+     * Helper implementation of pullRequestIterator that excludes files
+     * via the REST API.
+     *
+     * @param {string} targetBranch The base branch of the pull request
+     * @param {string} status The status of the pull request
+     * @param {number} maxResults Limit the number of results searched
+     */
+    async *pullRequestIteratorWithoutFiles(targetBranch, status = 'MERGED', maxResults = Number.MAX_SAFE_INTEGER) {
+        const statusMap = {
+            OPEN: 'open',
+            CLOSED: 'closed',
+            MERGED: 'closed',
+        };
+        let results = 0;
+        for await (const { data: pulls } of this.octokit.paginate.iterator('GET /repos/{owner}/{repo}/pulls', {
+            state: statusMap[status],
+            owner: this.repository.owner,
+            repo: this.repository.repo,
+            base: targetBranch,
+            sort: 'updated',
+            direction: 'desc',
+        })) {
+            for (const pull of pulls) {
+                // The REST API does not have an option for "merged"
+                // pull requests - they are closed with a `merged_at` timestamp
+                if (status !== 'MERGED' || pull.merged_at) {
+                    results += 1;
+                    yield {
+                        headBranchName: pull.head.ref,
+                        baseBranchName: pull.base.ref,
+                        number: pull.number,
+                        title: pull.title,
+                        body: pull.body || '',
+                        labels: pull.labels.map((label) => label.name),
+                        files: [],
+                        sha: pull.merge_commit_sha || undefined,
+                    };
+                    if (results >= maxResults) {
+                        break;
+                    }
+                }
+            }
+            if (results >= maxResults) {
+                break;
+            }
+        }
+    }
+    /**
+     * Return a list of merged pull requests. The list is not guaranteed to be sorted
+     * by merged_at, but is generally most recent first.
+     *
+     * @param {string} targetBranch - Base branch of the pull request. Defaults to
+     *   the configured default branch.
+     * @param {number} page - Page of results. Defaults to 1.
+     * @param {number} perPage - Number of results per page. Defaults to 100.
+     * @returns {PullRequestHistory | null} - List of merged pull requests
+     * @throws {GitHubAPIError} on an API error
+     */
+    async pullRequestsGraphQL(targetBranch, states = 'MERGED', cursor) {
+        var _a;
+        this.logger.debug(`Fetching ${states} pull requests on branch ${targetBranch} with cursor ${cursor}`);
+        const response = await this.graphqlRequest({
+            query: `query mergedPullRequests($owner: String!, $repo: String!, $num: Int!, $maxFilesChanged: Int, $targetBranch: String!, $states: [PullRequestState!], $cursor: String) {
+        repository(owner: $owner, name: $repo) {
+          pullRequests(first: $num, after: $cursor, baseRefName: $targetBranch, states: $states, orderBy: {field: CREATED_AT, direction: DESC}) {
+            nodes {
+              number
+              title
+              baseRefName
+              headRefName
+              labels(first: 10) {
+                nodes {
+                  name
+                }
+              }
+              body
+              mergeCommit {
+                oid
+              }
+              files(first: $maxFilesChanged) {
+                nodes {
+                  path
+                }
+                pageInfo {
+                  endCursor
+                  hasNextPage
+                }
+              }
+            }
+            pageInfo {
+              endCursor
+              hasNextPage
+            }
+          }
+        }
+      }`,
+            cursor,
+            owner: this.repository.owner,
+            repo: this.repository.repo,
+            num: 25,
+            targetBranch,
+            states,
+            maxFilesChanged: 64,
+        });
+        if (!((_a = response === null || response === void 0 ? void 0 : response.repository) === null || _a === void 0 ? void 0 : _a.pullRequests)) {
+            this.logger.warn(`Could not find merged pull requests for branch ${targetBranch} - it likely does not exist.`);
+            return null;
+        }
+        const pullRequests = (response.repository.pullRequests.nodes ||
+            []);
+        return {
+            pageInfo: response.repository.pullRequests.pageInfo,
+            data: pullRequests.map(pullRequest => {
+                var _a, _b, _c;
+                return {
+                    sha: (_a = pullRequest.mergeCommit) === null || _a === void 0 ? void 0 : _a.oid,
+                    number: pullRequest.number,
+                    baseBranchName: pullRequest.baseRefName,
+                    headBranchName: pullRequest.headRefName,
+                    labels: (((_b = pullRequest.labels) === null || _b === void 0 ? void 0 : _b.nodes) || []).map(l => l.name),
+                    title: pullRequest.title,
+                    body: pullRequest.body + '',
+                    files: (((_c = pullRequest.files) === null || _c === void 0 ? void 0 : _c.nodes) || []).map(node => node.path),
+                };
+            }),
+        };
+    }
+    /**
+     * Iterate through releases with a max number of results scanned.
+     *
+     * @param {ReleaseIteratorOptions} options Query options
+     * @param {number} options.maxResults Limit the number of results scanned.
+     *   Defaults to unlimited.
+     * @yields {ScmRelease}
+     * @throws {GitHubAPIError} on an API error
+     */
+    async *releaseIterator(options = {}) {
+        var _a;
+        const maxResults = (_a = options.maxResults) !== null && _a !== void 0 ? _a : Number.MAX_SAFE_INTEGER;
+        let results = 0;
+        let cursor = undefined;
+        while (true) {
+            const response = await this.releaseGraphQL(cursor);
+            if (!response) {
+                break;
+            }
+            for (let i = 0; i < response.data.length; i++) {
+                if ((results += 1) > maxResults) {
+                    break;
+                }
+                yield response.data[i];
+            }
+            if (results > maxResults || !response.pageInfo.hasNextPage) {
+                break;
+            }
+            cursor = response.pageInfo.endCursor;
+        }
+    }
+    async releaseGraphQL(cursor) {
+        var _a, _b, _c;
+        this.logger.debug(`Fetching releases with cursor ${cursor}`);
+        const response = await this.graphqlRequest({
+            query: `query releases($owner: String!, $repo: String!, $num: Int!, $cursor: String) {
+        repository(owner: $owner, name: $repo) {
+          releases(first: $num, after: $cursor, orderBy: {field: CREATED_AT, direction: DESC}) {
+            nodes {
+              name
+              tag {
+                name
+              }
+              tagCommit {
+                oid
+              }
+              url
+              description
+              isDraft
+            }
+            pageInfo {
+              endCursor
+              hasNextPage
+            }
+          }
+        }
+      }`,
+            cursor,
+            owner: this.repository.owner,
+            repo: this.repository.repo,
+            num: 25,
+        });
+        if (!((_c = (_b = (_a = response === null || response === void 0 ? void 0 : response.repository) === null || _a === void 0 ? void 0 : _a.releases) === null || _b === void 0 ? void 0 : _b.nodes) === null || _c === void 0 ? void 0 : _c.length)) {
+            this.logger.warn('Could not find releases.');
+            return null;
+        }
+        const releases = response.repository.releases.nodes;
+        return {
+            pageInfo: response.repository.releases.pageInfo,
+            data: releases
+                .filter(release => !!release.tagCommit)
+                .map(release => {
+                if (!release.tag || !release.tagCommit) {
+                    this.logger.debug(release);
+                }
+                return {
+                    name: release.name || undefined,
+                    tagName: release.tag ? release.tag.name : 'unknown',
+                    sha: release.tagCommit.oid,
+                    notes: release.description,
+                    url: release.url,
+                    draft: release.isDraft,
+                };
+            }),
+        };
+    }
+    /**
+     * Generate release notes from GitHub at tag
+     * @param {string} tagName Name of new release tag
+     * @param {string} targetCommitish Target commitish for new tag
+     * @param {string} previousTag Optional. Name of previous tag to analyze commits since
+     */
+    async generateReleaseNotes(tagName, targetCommitish, previousTag) {
+        const resp = await this.octokit.repos.generateReleaseNotes({
+            owner: this.repository.owner,
+            repo: this.repository.repo,
+            tag_name: tagName,
+            previous_tag_name: previousTag,
+            target_commitish: targetCommitish,
+        });
+        return resp.data.body;
+    }
+    /**
+     * Create a single file on a new branch based on an existing
+     * branch. This will force-push to that branch.
+     * @param {string} filename Filename with path in the repository
+     * @param {string} contents Contents of the file
+     * @param {string} newBranchName Name of the new branch
+     * @param {string} baseBranchName Name of the base branch (where
+     *   new branch is forked from)
+     * @returns {string} HTML URL of the new file
+     */
+    async createFileOnNewBranch(filename, contents, newBranchName, baseBranchName) {
+        // create or update new branch to match base branch
+        await this.forkBranch(newBranchName, baseBranchName);
+        // use the single file upload API
+        const { data: { content }, } = await this.octokit.repos.createOrUpdateFileContents({
+            owner: this.repository.owner,
+            repo: this.repository.repo,
+            path: filename,
+            // contents need to be base64 encoded
+            content: Buffer.from(contents, 'binary').toString('base64'),
+            message: 'Saving release notes',
+            branch: newBranchName,
+        });
+        return (content === null || content === void 0 ? void 0 : content.html_url) || '';
+    }
+    /**
+     * Fork a branch from a base branch.
+     */
+    async forkBranch(targetBranchName, baseBranchName) {
+        const baseBranchSha = await this.getBranchSha(baseBranchName);
+        if (!baseBranchSha) {
+            throw new errors_1.ConfigurationError(`Unable to find base branch: ${baseBranchName}`, 'core', `${this.repository.owner}/${this.repository.repo}`);
+        }
+        if (await this.getBranchSha(targetBranchName)) {
+            const branchSha = await this.updateBranchSha(targetBranchName, baseBranchSha);
+            this.logger.debug(`Updated ${targetBranchName} to match ${baseBranchName} at ${branchSha}`);
+            return branchSha;
+        }
+        else {
+            const branchSha = await this.createNewBranch(targetBranchName, baseBranchSha);
+            this.logger.debug(`Created ${targetBranchName} from ${baseBranchName} at ${branchSha}`);
+            return branchSha;
+        }
+    }
+    /**
+     * Helper to fetch the SHA of a branch
+     */
+    async getBranchSha(branchName) {
+        this.logger.debug(`Looking up SHA for branch: ${branchName}`);
+        try {
+            const { data: { object: { sha }, }, } = await this.octokit.git.getRef({
+                owner: this.repository.owner,
+                repo: this.repository.repo,
+                ref: `heads/${branchName}`,
+            });
+            this.logger.debug(`SHA for branch: ${sha}`);
+            return sha;
+        }
+        catch (e) {
+            if (e instanceof request_error_1.RequestError && e.status === 404) {
+                this.logger.debug(`Branch: ${branchName} does not exist`);
+                return undefined;
+            }
+            throw e;
+        }
+    }
+    /**
+     * Helper to create a new branch from a given SHA.
+     */
+    async createNewBranch(branchName, branchSha) {
+        this.logger.debug(`Creating new branch: ${branchName} at ${branchSha}`);
+        const { data: { object: { sha }, }, } = await this.octokit.git.createRef({
+            owner: this.repository.owner,
+            repo: this.repository.repo,
+            ref: `refs/heads/${branchName}`,
+            sha: branchSha,
+        });
+        this.logger.debug(`New branch: ${branchName} at ${sha}`);
+        return sha;
+    }
+    /**
+     * Helper to update branch SHA.
+     */
+    async updateBranchSha(branchName, branchSha) {
+        this.logger.debug(`Updating branch ${branchName} to ${branchSha}`);
+        const { data: { object: { sha }, }, } = await this.octokit.git.updateRef({
+            owner: this.repository.owner,
+            repo: this.repository.repo,
+            ref: `heads/${branchName}`,
+            sha: branchSha,
+            force: true,
+        });
+        this.logger.debug(`Updated branch: ${branchName} to ${sha}`);
+        return sha;
+    }
+}
+exports.GitHubApi = GitHubApi;
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const wrapAsync = (fn, errorHandler) => {
+    return async (...args) => {
+        try {
+            return await fn(...args);
+        }
+        catch (e) {
+            if (errorHandler) {
+                errorHandler(e);
+            }
+            if (e instanceof request_error_1.RequestError) {
+                throw new errors_1.GitHubAPIError(e);
+            }
+            throw e;
+        }
+    };
+};
+exports.wrapAsync = wrapAsync;
+const sleepInMs = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+exports.sleepInMs = sleepInMs;
+//# sourceMappingURL=github-api.js.map
+
+/***/ }),
+
 /***/ 19746:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -46866,23 +47582,17 @@ exports.getReleaserTypes = getReleaserTypes;
 // See the License for the specific language governing permissions and
 // limitations under the License.
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.sleepInMs = exports.GitHub = exports.GH_GRAPHQL_URL = exports.GH_API_URL = void 0;
-const code_suggester_1 = __nccwpck_require__(77103);
-const rest_1 = __nccwpck_require__(55375);
-const request_1 = __nccwpck_require__(36234);
-const graphql_1 = __nccwpck_require__(88467);
+exports.sleepInMs = exports.GitHub = void 0;
 const request_error_1 = __nccwpck_require__(10537);
+const code_suggester_1 = __nccwpck_require__(77103);
 const errors_1 = __nccwpck_require__(93637);
 const MAX_ISSUE_BODY_SIZE = 65536;
 const MAX_SLEEP_SECONDS = 20;
-exports.GH_API_URL = 'https://api.github.com';
-exports.GH_GRAPHQL_URL = 'https://api.github.com';
 const logger_1 = __nccwpck_require__(68809);
 const manifest_1 = __nccwpck_require__(31999);
+const github_api_1 = __nccwpck_require__(27485);
 const signoff_commit_message_1 = __nccwpck_require__(2686);
 const git_file_utils_1 = __nccwpck_require__(32997);
-const https_proxy_agent_1 = __nccwpck_require__(77219);
-const http_proxy_agent_1 = __nccwpck_require__(23764);
 const composite_1 = __nccwpck_require__(40911);
 class GitHub {
     constructor(options) {
@@ -46987,118 +47697,6 @@ class GitHub {
             return await this.fileCache.findFilesByGlob(glob, ref, prefix);
         });
         /**
-         * Open a pull request
-         *
-         * @param {PullRequest} pullRequest Pull request data to update
-         * @param {string} targetBranch The base branch of the pull request
-         * @param {string} message The commit message for the commit
-         * @param {Update[]} updates The files to update
-         * @param {CreatePullRequestOptions} options The pull request options
-         * @throws {GitHubAPIError} on an API error
-         */
-        this.createPullRequest = wrapAsync(async (pullRequest, targetBranch, message, updates, options) => {
-            //  Update the files for the release if not already supplied
-            const changes = await this.buildChangeSet(updates, targetBranch);
-            const prNumber = await (0, code_suggester_1.createPullRequest)(this.octokit, changes, {
-                upstreamOwner: this.repository.owner,
-                upstreamRepo: this.repository.repo,
-                title: pullRequest.title,
-                branch: pullRequest.headBranchName,
-                description: pullRequest.body,
-                primary: targetBranch,
-                force: true,
-                fork: !!(options === null || options === void 0 ? void 0 : options.fork),
-                message,
-                logger: this.logger,
-                draft: !!(options === null || options === void 0 ? void 0 : options.draft),
-                labels: pullRequest.labels,
-            });
-            return await this.getPullRequest(prNumber);
-        });
-        /**
-         * Fetch a pull request given the pull number
-         * @param {number} number The pull request number
-         * @returns {PullRequest}
-         */
-        this.getPullRequest = wrapAsync(async (number) => {
-            const response = await this.octokit.pulls.get({
-                owner: this.repository.owner,
-                repo: this.repository.repo,
-                pull_number: number,
-            });
-            return {
-                headBranchName: response.data.head.ref,
-                baseBranchName: response.data.base.ref,
-                number: response.data.number,
-                title: response.data.title,
-                body: response.data.body || '',
-                files: [],
-                labels: response.data.labels
-                    .map(label => label.name)
-                    .filter(name => !!name),
-            };
-        });
-        /**
-         * Update a pull request's title and body.
-         * @param {number} number The pull request number
-         * @param {ReleasePullRequest} releasePullRequest Pull request data to update
-         * @param {string} targetBranch The target branch of the pull request
-         * @param {string} options.signoffUser Optional. Commit signoff message
-         * @param {boolean} options.fork Optional. Whether to open the pull request from
-         *   a fork or not. Defaults to `false`
-         * @param {PullRequestOverflowHandler} options.pullRequestOverflowHandler Optional.
-         *   Handles extra large pull request body messages.
-         */
-        this.updatePullRequest = wrapAsync(async (number, releasePullRequest, targetBranch, options) => {
-            //  Update the files for the release if not already supplied
-            const changes = await this.buildChangeSet(releasePullRequest.updates, targetBranch);
-            let message = releasePullRequest.title.toString();
-            if (options === null || options === void 0 ? void 0 : options.signoffUser) {
-                message = (0, signoff_commit_message_1.signoffCommitMessage)(message, options.signoffUser);
-            }
-            const title = releasePullRequest.title.toString();
-            const body = ((options === null || options === void 0 ? void 0 : options.pullRequestOverflowHandler)
-                ? await options.pullRequestOverflowHandler.handleOverflow(releasePullRequest)
-                : releasePullRequest.body)
-                .toString()
-                .slice(0, MAX_ISSUE_BODY_SIZE);
-            const prNumber = await (0, code_suggester_1.createPullRequest)(this.octokit, changes, {
-                upstreamOwner: this.repository.owner,
-                upstreamRepo: this.repository.repo,
-                title,
-                branch: releasePullRequest.headRefName,
-                description: body,
-                primary: targetBranch,
-                force: true,
-                fork: (options === null || options === void 0 ? void 0 : options.fork) === false ? false : true,
-                message,
-                logger: this.logger,
-                draft: releasePullRequest.draft,
-            });
-            if (prNumber !== number) {
-                this.logger.warn(`updated code for ${prNumber}, but update requested for ${number}`);
-            }
-            const response = await this.octokit.pulls.update({
-                owner: this.repository.owner,
-                repo: this.repository.repo,
-                pull_number: number,
-                title: releasePullRequest.title.toString(),
-                body,
-                state: 'open',
-            });
-            return {
-                headBranchName: response.data.head.ref,
-                baseBranchName: response.data.base.ref,
-                number: response.data.number,
-                title: response.data.title,
-                body: response.data.body || '',
-                files: [],
-                labels: response.data.labels
-                    .map(label => label.name)
-                    .filter(name => !!name),
-            };
-        });
-        /**
          * Returns a list of paths to all files with a given file
          * extension.
          *
@@ -47118,194 +47716,27 @@ class GitHub {
             }
             return this.fileCache.findFilesByExtension(extension, ref, prefix);
         });
-        /**
-         * Create a GitHub release
-         *
-         * @param {Release} release Release parameters
-         * @param {ReleaseOptions} options Release option parameters
-         * @throws {DuplicateReleaseError} if the release tag already exists
-         * @throws {GitHubAPIError} on other API errors
-         */
-        this.createRelease = wrapAsync(async (release, options = {}) => {
-            const resp = await this.octokit.repos.createRelease({
-                name: release.name,
-                owner: this.repository.owner,
-                repo: this.repository.repo,
-                tag_name: release.tag.toString(),
-                body: release.notes,
-                draft: !!options.draft,
-                prerelease: !!options.prerelease,
-                target_commitish: release.sha,
-            });
-            return {
-                id: resp.data.id,
-                name: resp.data.name || undefined,
-                tagName: resp.data.tag_name,
-                sha: resp.data.target_commitish,
-                notes: resp.data.body_text ||
-                    resp.data.body ||
-                    resp.data.body_html ||
-                    undefined,
-                url: resp.data.html_url,
-                draft: resp.data.draft,
-                uploadUrl: resp.data.upload_url,
-            };
-        }, e => {
-            if (e instanceof request_error_1.RequestError) {
-                if (e.status === 422 &&
-                    errors_1.GitHubAPIError.parseErrors(e).some(error => {
-                        return error.code === 'already_exists';
-                    })) {
-                    throw new errors_1.DuplicateReleaseError(e, 'tagName');
-                }
-            }
-        });
-        /**
-         * Makes a comment on a issue/pull request.
-         *
-         * @param {string} comment - The body of the comment to post.
-         * @param {number} number - The issue or pull request number.
-         * @throws {GitHubAPIError} on an API error
-         */
-        this.commentOnIssue = wrapAsync(async (comment, number) => {
-            this.logger.debug(`adding comment to https://github.com/${this.repository.owner}/${this.repository.repo}/issues/${number}`);
-            const resp = await this.octokit.issues.createComment({
-                owner: this.repository.owner,
-                repo: this.repository.repo,
-                issue_number: number,
-                body: comment,
-            });
-            return resp.data.html_url;
-        });
-        /**
-         * Removes labels from an issue/pull request.
-         *
-         * @param {string[]} labels The labels to remove.
-         * @param {number} number The issue/pull request number.
-         */
-        this.removeIssueLabels = wrapAsync(async (labels, number) => {
-            if (labels.length === 0) {
-                return;
-            }
-            this.logger.debug(`removing labels: ${labels} from issue/pull ${number}`);
-            await Promise.all(labels.map(label => this.octokit.issues.removeLabel({
-                owner: this.repository.owner,
-                repo: this.repository.repo,
-                issue_number: number,
-                name: label,
-            })));
-        });
-        /**
-         * Adds label to an issue/pull request.
-         *
-         * @param {string[]} labels The labels to add.
-         * @param {number} number The issue/pull request number.
-         */
-        this.addIssueLabels = wrapAsync(async (labels, number) => {
-            if (labels.length === 0) {
-                return;
-            }
-            this.logger.debug(`adding labels: ${labels} from issue/pull ${number}`);
-            await this.octokit.issues.addLabels({
-                owner: this.repository.owner,
-                repo: this.repository.repo,
-                issue_number: number,
-                labels,
-            });
-        });
         this.repository = options.repository;
         this.octokit = options.octokitAPIs.octokit;
-        this.request = options.octokitAPIs.request;
         this.graphql = options.octokitAPIs.graphql;
         this.fileCache = new git_file_utils_1.RepositoryFileCache(this.octokit, this.repository);
         this.logger = (_a = options.logger) !== null && _a !== void 0 ? _a : logger_1.logger;
-    }
-    static createDefaultAgent(baseUrl, defaultProxy) {
-        if (!defaultProxy) {
-            return undefined;
-        }
-        const { host, port } = defaultProxy;
-        if (new URL(baseUrl).protocol.replace(':', '') === 'http') {
-            return new http_proxy_agent_1.HttpProxyAgent(`http://${host}:${port}`);
-        }
-        else {
-            return new https_proxy_agent_1.HttpsProxyAgent(`https://${host}:${port}`);
-        }
-    }
-    /**
-     * Build a new GitHub client with auto-detected default branch.
-     *
-     * @param {GitHubCreateOptions} options Configuration options
-     * @param {string} options.owner The repository owner.
-     * @param {string} options.repo The repository name.
-     * @param {string} options.defaultBranch Optional. The repository's default branch.
-     *   Defaults to the value fetched via the API.
-     * @param {string} options.apiUrl Optional. The base url of the GitHub API.
-     * @param {string} options.graphqlUrl Optional. The base url of the GraphQL API.
-     * @param {OctokitAPISs} options.octokitAPIs Optional. Override the internal
-     *   client instances with a pre-authenticated instance.
-     * @param {string} token Optional. A GitHub API token used for authentication.
-     */
-    static async create(options) {
-        var _a, _b, _c, _d;
-        const apiUrl = (_a = options.apiUrl) !== null && _a !== void 0 ? _a : exports.GH_API_URL;
-        const graphqlUrl = (_b = options.graphqlUrl) !== null && _b !== void 0 ? _b : exports.GH_GRAPHQL_URL;
-        const releasePleaseVersion = (__nccwpck_require__(40255)/* .version */ .i8);
-        const apis = (_c = options.octokitAPIs) !== null && _c !== void 0 ? _c : {
-            octokit: new rest_1.Octokit({
-                baseUrl: apiUrl,
-                auth: options.token,
-                request: {
-                    agent: this.createDefaultAgent(apiUrl, options.proxy),
-                    fetch: options.fetch,
-                },
-            }),
-            request: request_1.request.defaults({
-                baseUrl: apiUrl,
-                headers: {
-                    'user-agent': `release-please/${releasePleaseVersion}`,
-                    Authorization: `token ${options.token}`,
-                },
-                fetch: options.fetch,
-            }),
-            graphql: graphql_1.graphql.defaults({
-                baseUrl: graphqlUrl,
-                request: {
-                    agent: this.createDefaultAgent(graphqlUrl, options.proxy),
-                    fetch: options.fetch,
-                },
-                headers: {
-                    'user-agent': `release-please/${releasePleaseVersion}`,
-                    Authorization: `token ${options.token}`,
-                    'content-type': 'application/vnd.github.v3+json',
-                },
-            }),
-        };
-        const opts = {
-            repository: {
-                owner: options.owner,
-                repo: options.repo,
-                defaultBranch: (_d = options.defaultBranch) !== null && _d !== void 0 ? _d : (await GitHub.defaultBranch(options.owner, options.repo, apis.octokit)),
-            },
-            octokitAPIs: apis,
-            logger: options.logger,
-        };
-        return new GitHub(opts);
-    }
-    /**
-     * Returns the default branch for a given repository.
-     *
-     * @param {string} owner The GitHub repository owner
-     * @param {string} repo The GitHub repository name
-     * @param {OctokitType} octokit An authenticated octokit instance
-     * @returns {string} Name of the default branch
-     */
-    static async defaultBranch(owner, repo, octokit) {
-        const { data } = await octokit.repos.get({
-            repo,
-            owner,
+        this.gitHubApi = new github_api_1.GitHubApi({
+            repository: this.repository,
+            octokitAPIs: options.octokitAPIs,
+            logger: this.logger,
         });
-        return data.default_branch;
+    }
+    getGitHubApi() {
+        return this.gitHubApi;
+    }
+    static async create(options) {
+        const gitHubApi = await github_api_1.GitHubApi.create(options);
+        return new GitHub({
+            repository: gitHubApi.repository,
+            octokitAPIs: gitHubApi.octokitAPIs,
+            logger: options.logger,
+        });
     }
     /**
      * Returns the list of commits to the default branch after the provided filter
@@ -47367,8 +47798,8 @@ class GitHub {
         }
     }
     async mergeCommitsGraphQL(targetBranch, cursor, options = {}) {
-        var _a, _b, _c, _d, _e, _f, _g, _h;
-        var _j;
+        var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k;
+        var _l;
         this.logger.debug(`Fetching merge commits on branch ${targetBranch} with cursor: ${cursor}`);
         const query = `query pullRequestsSince($owner: String!, $repo: String!, $num: Int!, $maxFilesChanged: Int, $targetBranch: String!, $cursor: String) {
       repository(owner: $owner, name: $repo) {
@@ -47405,6 +47836,13 @@ class GitHub {
                   }
                   sha: oid
                   message
+                  author {
+                    name
+                    email
+                    user {
+                      login
+                    }
+                  }
                 }
                 pageInfo {
                   hasNextPage
@@ -47420,7 +47858,7 @@ class GitHub {
             cursor,
             owner: this.repository.owner,
             repo: this.repository.repo,
-            num: 10,
+            num: (_a = options.batchSize) !== null && _a !== void 0 ? _a : 10,
             targetBranch,
             maxFilesChanged: 100, // max is 100
         };
@@ -47433,7 +47871,7 @@ class GitHub {
             return null;
         }
         // if the branch does exist, return null
-        if (!((_a = response.repository) === null || _a === void 0 ? void 0 : _a.ref)) {
+        if (!((_b = response.repository) === null || _b === void 0 ? void 0 : _b.ref)) {
             this.logger.warn(`Could not find commits for branch ${targetBranch} - it likely does not exist.`);
             return null;
         }
@@ -47445,8 +47883,8 @@ class GitHub {
         const mergeCommitCount = {};
         for (const commit of commits) {
             for (const pr of commit.associatedPullRequests.nodes) {
-                if ((_b = pr.mergeCommit) === null || _b === void 0 ? void 0 : _b.oid) {
-                    (_c = mergeCommitCount[_j = pr.mergeCommit.oid]) !== null && _c !== void 0 ? _c : (mergeCommitCount[_j] = 0);
+                if ((_c = pr.mergeCommit) === null || _c === void 0 ? void 0 : _c.oid) {
+                    (_d = mergeCommitCount[_l = pr.mergeCommit.oid]) !== null && _d !== void 0 ? _d : (mergeCommitCount[_l] = 0);
                     mergeCommitCount[pr.mergeCommit.oid]++;
                 }
             }
@@ -47456,6 +47894,13 @@ class GitHub {
             const commit = {
                 sha: graphCommit.sha,
                 message: graphCommit.message,
+                author: graphCommit.author
+                    ? {
+                        name: graphCommit.author.name || 'Unknown',
+                        email: graphCommit.author.email,
+                        username: (_e = graphCommit.author.user) === null || _e === void 0 ? void 0 : _e.login,
+                    }
+                    : undefined,
             };
             const mergePullRequest = graphCommit.associatedPullRequests.nodes.find(pr => {
                 return (
@@ -47476,15 +47921,15 @@ class GitHub {
                     number: pullRequest.number,
                     baseBranchName: pullRequest.baseRefName,
                     headBranchName: pullRequest.headRefName,
-                    mergeCommitOid: (_d = pullRequest.mergeCommit) === null || _d === void 0 ? void 0 : _d.oid,
+                    mergeCommitOid: (_f = pullRequest.mergeCommit) === null || _f === void 0 ? void 0 : _f.oid,
                     title: pullRequest.title,
                     body: pullRequest.body,
                     labels: pullRequest.labels.nodes.map(node => node.name),
-                    files: (((_e = pullRequest.files) === null || _e === void 0 ? void 0 : _e.nodes) || []).map(node => node.path),
+                    files: (((_g = pullRequest.files) === null || _g === void 0 ? void 0 : _g.nodes) || []).map(node => node.path),
                 };
             }
             if (mergePullRequest) {
-                if (((_g = (_f = mergePullRequest.files) === null || _f === void 0 ? void 0 : _f.pageInfo) === null || _g === void 0 ? void 0 : _g.hasNextPage) &&
+                if (((_j = (_h = mergePullRequest.files) === null || _h === void 0 ? void 0 : _h.pageInfo) === null || _j === void 0 ? void 0 : _j.hasNextPage) &&
                     options.backfillFiles) {
                     this.logger.info(`PR #${mergePullRequest.number} has many files, backfilling`);
                     commit.files = await this.getCommitFiles(graphCommit.sha);
@@ -47492,7 +47937,7 @@ class GitHub {
                 else {
                     // We cannot directly fetch files on commits via graphql, only provide file
                     // information for commits with associated pull requests
-                    commit.files = (((_h = mergePullRequest.files) === null || _h === void 0 ? void 0 : _h.nodes) || []).map(node => node.path);
+                    commit.files = (((_k = mergePullRequest.files) === null || _k === void 0 ? void 0 : _k.nodes) || []).map(node => node.path);
                 }
             }
             else if (options.backfillFiles) {
@@ -47522,167 +47967,7 @@ class GitHub {
      * @throws {GitHubAPIError} on an API error
      */
     async *pullRequestIterator(targetBranch, status = 'MERGED', maxResults = Number.MAX_SAFE_INTEGER, includeFiles = true) {
-        const generator = includeFiles
-            ? this.pullRequestIteratorWithFiles(targetBranch, status, maxResults)
-            : this.pullRequestIteratorWithoutFiles(targetBranch, status, maxResults);
-        for await (const pullRequest of generator) {
-            yield pullRequest;
-        }
-    }
-    /**
-     * Helper implementation of pullRequestIterator that includes files via
-     * the graphQL API.
-     *
-     * @param {string} targetBranch The base branch of the pull request
-     * @param {string} status The status of the pull request
-     * @param {number} maxResults Limit the number of results searched
-     */
-    async *pullRequestIteratorWithFiles(targetBranch, status = 'MERGED', maxResults = Number.MAX_SAFE_INTEGER) {
-        let cursor = undefined;
-        let results = 0;
-        while (results < maxResults) {
-            const response = await this.pullRequestsGraphQL(targetBranch, status, cursor);
-            // no response usually means we ran out of results
-            if (!response) {
-                break;
-            }
-            for (let i = 0; i < response.data.length; i++) {
-                results += 1;
-                yield response.data[i];
-            }
-            if (!response.pageInfo.hasNextPage) {
-                break;
-            }
-            cursor = response.pageInfo.endCursor;
-        }
-    }
-    /**
-     * Helper implementation of pullRequestIterator that excludes files
-     * via the REST API.
-     *
-     * @param {string} targetBranch The base branch of the pull request
-     * @param {string} status The status of the pull request
-     * @param {number} maxResults Limit the number of results searched
-     */
-    async *pullRequestIteratorWithoutFiles(targetBranch, status = 'MERGED', maxResults = Number.MAX_SAFE_INTEGER) {
-        const statusMap = {
-            OPEN: 'open',
-            CLOSED: 'closed',
-            MERGED: 'closed',
-        };
-        let results = 0;
-        for await (const { data: pulls } of this.octokit.paginate.iterator('GET /repos/{owner}/{repo}/pulls', {
-            state: statusMap[status],
-            owner: this.repository.owner,
-            repo: this.repository.repo,
-            base: targetBranch,
-            sort: 'updated',
-            direction: 'desc',
-        })) {
-            for (const pull of pulls) {
-                // The REST API does not have an option for "merged"
-                // pull requests - they are closed with a `merged_at` timestamp
-                if (status !== 'MERGED' || pull.merged_at) {
-                    results += 1;
-                    yield {
-                        headBranchName: pull.head.ref,
-                        baseBranchName: pull.base.ref,
-                        number: pull.number,
-                        title: pull.title,
-                        body: pull.body || '',
-                        labels: pull.labels.map(label => label.name),
-                        files: [],
-                        sha: pull.merge_commit_sha || undefined,
-                    };
-                    if (results >= maxResults) {
-                        break;
-                    }
-                }
-            }
-            if (results >= maxResults) {
-                break;
-            }
-        }
-    }
-    /**
-     * Return a list of merged pull requests. The list is not guaranteed to be sorted
-     * by merged_at, but is generally most recent first.
-     *
-     * @param {string} targetBranch - Base branch of the pull request. Defaults to
-     *   the configured default branch.
-     * @param {number} page - Page of results. Defaults to 1.
-     * @param {number} perPage - Number of results per page. Defaults to 100.
-     * @returns {PullRequestHistory | null} - List of merged pull requests
-     * @throws {GitHubAPIError} on an API error
-     */
-    async pullRequestsGraphQL(targetBranch, states = 'MERGED', cursor) {
-        var _a;
-        this.logger.debug(`Fetching ${states} pull requests on branch ${targetBranch} with cursor ${cursor}`);
-        const response = await this.graphqlRequest({
-            query: `query mergedPullRequests($owner: String!, $repo: String!, $num: Int!, $maxFilesChanged: Int, $targetBranch: String!, $states: [PullRequestState!], $cursor: String) {
-        repository(owner: $owner, name: $repo) {
-          pullRequests(first: $num, after: $cursor, baseRefName: $targetBranch, states: $states, orderBy: {field: CREATED_AT, direction: DESC}) {
-            nodes {
-              number
-              title
-              baseRefName
-              headRefName
-              labels(first: 10) {
-                nodes {
-                  name
-                }
-              }
-              body
-              mergeCommit {
-                oid
-              }
-              files(first: $maxFilesChanged) {
-                nodes {
-                  path
-                }
-                pageInfo {
-                  endCursor
-                  hasNextPage
-                }
-              }
-            }
-            pageInfo {
-              endCursor
-              hasNextPage
-            }
-          }
-        }
-      }`,
-            cursor,
-            owner: this.repository.owner,
-            repo: this.repository.repo,
-            num: 25,
-            targetBranch,
-            states,
-            maxFilesChanged: 64,
-        });
-        if (!((_a = response === null || response === void 0 ? void 0 : response.repository) === null || _a === void 0 ? void 0 : _a.pullRequests)) {
-            this.logger.warn(`Could not find merged pull requests for branch ${targetBranch} - it likely does not exist.`);
-            return null;
-        }
-        const pullRequests = (response.repository.pullRequests.nodes ||
-            []);
-        return {
-            pageInfo: response.repository.pullRequests.pageInfo,
-            data: pullRequests.map(pullRequest => {
-                var _a, _b, _c;
-                return {
-                    sha: (_a = pullRequest.mergeCommit) === null || _a === void 0 ? void 0 : _a.oid,
-                    number: pullRequest.number,
-                    baseBranchName: pullRequest.baseRefName,
-                    headBranchName: pullRequest.headRefName,
-                    labels: (((_b = pullRequest.labels) === null || _b === void 0 ? void 0 : _b.nodes) || []).map(l => l.name),
-                    title: pullRequest.title,
-                    body: pullRequest.body + '',
-                    files: (((_c = pullRequest.files) === null || _c === void 0 ? void 0 : _c.nodes) || []).map(node => node.path),
-                };
-            }),
-        };
+        yield* this.gitHubApi.pullRequestIterator(targetBranch, status, maxResults, includeFiles);
     }
     /**
      * Iterate through releases with a max number of results scanned.
@@ -47694,80 +47979,7 @@ class GitHub {
      * @throws {GitHubAPIError} on an API error
      */
     async *releaseIterator(options = {}) {
-        var _a;
-        const maxResults = (_a = options.maxResults) !== null && _a !== void 0 ? _a : Number.MAX_SAFE_INTEGER;
-        let results = 0;
-        let cursor = undefined;
-        while (true) {
-            const response = await this.releaseGraphQL(cursor);
-            if (!response) {
-                break;
-            }
-            for (let i = 0; i < response.data.length; i++) {
-                if ((results += 1) > maxResults) {
-                    break;
-                }
-                yield response.data[i];
-            }
-            if (results > maxResults || !response.pageInfo.hasNextPage) {
-                break;
-            }
-            cursor = response.pageInfo.endCursor;
-        }
-    }
-    async releaseGraphQL(cursor) {
-        this.logger.debug(`Fetching releases with cursor ${cursor}`);
-        const response = await this.graphqlRequest({
-            query: `query releases($owner: String!, $repo: String!, $num: Int!, $cursor: String) {
-        repository(owner: $owner, name: $repo) {
-          releases(first: $num, after: $cursor, orderBy: {field: CREATED_AT, direction: DESC}) {
-            nodes {
-              name
-              tag {
-                name
-              }
-              tagCommit {
-                oid
-              }
-              url
-              description
-              isDraft
-            }
-            pageInfo {
-              endCursor
-              hasNextPage
-            }
-          }
-        }
-      }`,
-            cursor,
-            owner: this.repository.owner,
-            repo: this.repository.repo,
-            num: 25,
-        });
-        if (!response.repository.releases.nodes.length) {
-            this.logger.warn('Could not find releases.');
-            return null;
-        }
-        const releases = response.repository.releases.nodes;
-        return {
-            pageInfo: response.repository.releases.pageInfo,
-            data: releases
-                .filter(release => !!release.tagCommit)
-                .map(release => {
-                if (!release.tag || !release.tagCommit) {
-                    this.logger.debug(release);
-                }
-                return {
-                    name: release.name || undefined,
-                    tagName: release.tag ? release.tag.name : 'unknown',
-                    sha: release.tagCommit.oid,
-                    notes: release.description,
-                    url: release.url,
-                    draft: release.isDraft,
-                };
-            }),
-        };
+        yield* this.gitHubApi.releaseIterator(options);
     }
     /**
      * Iterate through tags with a max number of results scanned.
@@ -47864,33 +48076,91 @@ class GitHub {
     /**
      * Open a pull request
      *
-     * @deprecated This logic is handled by the Manifest class now as it
-     *   can be more complicated if the release notes are too big
-     * @param {ReleasePullRequest} releasePullRequest Pull request data to update
+     * @param {PullRequest} pullRequest Pull request data to update
      * @param {string} targetBranch The base branch of the pull request
-     * @param {GitHubPR} options The pull request options
+     * @param {string} message The commit message for the commit
+     * @param {Update[]} updates The files to update
+     * @param {CreatePullRequestOptions} options The pull request options
      * @throws {GitHubAPIError} on an API error
      */
-    async createReleasePullRequest(releasePullRequest, targetBranch, options) {
+    async createPullRequest(pullRequest, targetBranch, message, updates, options) {
+        const changes = await this.buildChangeSet(updates, targetBranch);
+        const prNumber = await (0, code_suggester_1.createPullRequest)(this.octokit, changes, {
+            upstreamOwner: this.repository.owner,
+            upstreamRepo: this.repository.repo,
+            title: pullRequest.title,
+            branch: pullRequest.headBranchName,
+            description: pullRequest.body,
+            primary: targetBranch,
+            force: true,
+            fork: !!(options === null || options === void 0 ? void 0 : options.fork),
+            message,
+            logger: this.logger,
+            draft: !!(options === null || options === void 0 ? void 0 : options.draft),
+            labels: pullRequest.labels,
+        });
+        if (prNumber === 0) {
+            this.logger.warn('no code changes detected, skipping pull request creation');
+            return {
+                headBranchName: pullRequest.headBranchName,
+                baseBranchName: targetBranch,
+                number: 0,
+                title: pullRequest.title,
+                body: pullRequest.body,
+                labels: pullRequest.labels,
+                files: [],
+            };
+        }
+        return await this.getPullRequest(prNumber);
+    }
+    /**
+     * Fetch a pull request given the pull number
+     * @param {number} number The pull request number
+     * @returns {PullRequest}
+     */
+    async getPullRequest(number) {
+        return await this.gitHubApi.getPullRequest(number);
+    }
+    /**
+     * Update a pull request's title and body.
+     * @param {number} number The pull request number
+     * @param {ReleasePullRequest} releasePullRequest Pull request data to update
+     * @param {string} targetBranch The target branch of the pull request
+     * @param {string} options.signoffUser Optional. Commit signoff message
+     * @param {boolean} options.fork Optional. Whether to open the pull request from
+     *   a fork or not. Defaults to `false`
+     * @param {PullRequestOverflowHandler} options.pullRequestOverflowHandler Optional.
+     *   Handles extra large pull request body messages.
+     */
+    async updatePullRequest(number, releasePullRequest, targetBranch, options) {
+        const changes = await this.buildChangeSet(releasePullRequest.updates, targetBranch);
         let message = releasePullRequest.title.toString();
         if (options === null || options === void 0 ? void 0 : options.signoffUser) {
             message = (0, signoff_commit_message_1.signoffCommitMessage)(message, options.signoffUser);
         }
-        const pullRequestLabels = (options === null || options === void 0 ? void 0 : options.skipLabeling)
-            ? []
-            : releasePullRequest.labels;
-        return await this.createPullRequest({
-            headBranchName: releasePullRequest.headRefName,
-            baseBranchName: targetBranch,
-            number: -1,
-            title: releasePullRequest.title.toString(),
-            body: releasePullRequest.body.toString().slice(0, MAX_ISSUE_BODY_SIZE),
-            labels: pullRequestLabels,
-            files: [],
-        }, targetBranch, message, releasePullRequest.updates, {
-            fork: options === null || options === void 0 ? void 0 : options.fork,
+        const title = releasePullRequest.title.toString();
+        const body = ((options === null || options === void 0 ? void 0 : options.pullRequestOverflowHandler)
+            ? await options.pullRequestOverflowHandler.handleOverflow(releasePullRequest)
+            : releasePullRequest.body)
+            .toString()
+            .slice(0, MAX_ISSUE_BODY_SIZE);
+        const prNumber = await (0, code_suggester_1.createPullRequest)(this.octokit, changes, {
+            upstreamOwner: this.repository.owner,
+            upstreamRepo: this.repository.repo,
+            title,
+            branch: releasePullRequest.headRefName,
+            description: body,
+            primary: targetBranch,
+            force: true,
+            fork: (options === null || options === void 0 ? void 0 : options.fork) === false ? false : true,
+            message,
+            logger: this.logger,
             draft: releasePullRequest.draft,
         });
+        if (prNumber !== number) {
+            this.logger.warn(`updated code for ${prNumber}, but update requested for ${number}`);
+        }
+        return this.gitHubApi.updatePullRequest(number, title, body);
     }
     /**
      * Given a set of proposed updates, build a changeset to suggest.
@@ -47952,20 +48222,52 @@ class GitHub {
         return this.findFilesByExtensionAndRef(extension, this.repository.defaultBranch, prefix);
     }
     /**
+     * Create a GitHub release
+     *
+     * @param {Release} release Release parameters
+     * @param {ReleaseOptions} options Release option parameters
+     * @throws {DuplicateReleaseError} if the release tag already exists
+     * @throws {GitHubAPIError} on other API errors
+     */
+    async createRelease(release, options = {}) {
+        return await this.gitHubApi.createRelease(release, options);
+    }
+    /**
+     * Makes a comment on a issue/pull request.
+     *
+     * @param {string} comment - The body of the comment to post.
+     * @param {number} number - The issue or pull request number.
+     * @throws {GitHubAPIError} on an API error
+     */
+    async commentOnIssue(comment, number) {
+        return await this.gitHubApi.commentOnIssue(comment, number);
+    }
+    /**
+     * Removes labels from an issue/pull request.
+     *
+     * @param {string[]} labels The labels to remove.
+     * @param {number} number The issue/pull request number.
+     */
+    async removeIssueLabels(labels, number) {
+        return await this.gitHubApi.removeIssueLabels(labels, number);
+    }
+    /**
+     * Adds label to an issue/pull request.
+     *
+     * @param {string[]} labels The labels to add.
+     * @param {number} number The issue/pull request number.
+     */
+    async addIssueLabels(labels, number) {
+        return await this.gitHubApi.addIssueLabels(labels, number);
+    }
+    /**
      * Generate release notes from GitHub at tag
      * @param {string} tagName Name of new release tag
      * @param {string} targetCommitish Target commitish for new tag
      * @param {string} previousTag Optional. Name of previous tag to analyze commits since
      */
     async generateReleaseNotes(tagName, targetCommitish, previousTag) {
-        const resp = await this.octokit.repos.generateReleaseNotes({
-            owner: this.repository.owner,
-            repo: this.repository.repo,
-            tag_name: tagName,
-            previous_tag_name: previousTag,
-            target_commitish: targetCommitish,
-        });
-        return resp.data.body;
+        return await this.gitHubApi.generateReleaseNotes(tagName, targetCommitish, previousTag);
     }
     /**
      * Create a single file on a new branch based on an existing
@@ -47978,107 +48280,7 @@ class GitHub {
      * @returns {string} HTML URL of the new file
      */
     async createFileOnNewBranch(filename, contents, newBranchName, baseBranchName) {
-        // create or update new branch to match base branch
-        await this.forkBranch(newBranchName, baseBranchName);
-        // use the single file upload API
-        const { data: { content }, } = await this.octokit.repos.createOrUpdateFileContents({
-            owner: this.repository.owner,
-            repo: this.repository.repo,
-            path: filename,
-            // contents need to be base64 encoded
-            content: Buffer.from(contents, 'binary').toString('base64'),
-            message: 'Saving release notes',
-            branch: newBranchName,
-        });
-        if (!(content === null || content === void 0 ? void 0 : content.html_url)) {
-            throw new Error(`Failed to write to file: ${filename} on branch: ${newBranchName}`);
-        }
-        return content.html_url;
-    }
-    /**
-     * Helper to fetch the SHA of a branch
-     * @param {string} branchName The name of the branch
-     * @return {string | undefined} Returns the SHA of the branch
-     *   or undefined if it can't be found.
-     */
-    async getBranchSha(branchName) {
-        this.logger.debug(`Looking up SHA for branch: ${branchName}`);
-        try {
-            const { data: { object: { sha }, }, } = await this.octokit.git.getRef({
-                owner: this.repository.owner,
-                repo: this.repository.repo,
-                ref: `heads/${branchName}`,
-            });
-            this.logger.debug(`SHA for branch: ${sha}`);
-            return sha;
-        }
-        catch (e) {
-            if (e instanceof request_error_1.RequestError && e.status === 404) {
-                this.logger.debug(`Branch: ${branchName} does not exist`);
-                return undefined;
-            }
-            throw e;
-        }
-    }
-    /**
-     * Helper to fork a branch from an existing branch. Uses `force` so
-     * it will overwrite the contents of `targetBranchName` to match
-     * the current contents of `baseBranchName`.
-     *
-     * @param {string} targetBranchName The name of the new forked branch
-     * @param {string} baseBranchName The base branch from which to fork.
-     * @returns {string} The branch SHA
-     * @throws {ConfigurationError} if the base branch cannot be found.
-     */
-    async forkBranch(targetBranchName, baseBranchName) {
-        const baseBranchSha = await this.getBranchSha(baseBranchName);
-        if (!baseBranchSha) {
-            // this is highly unlikely to be thrown as we will have
-            // already attempted to read from the branch
-            throw new errors_1.ConfigurationError(`Unable to find base branch: ${baseBranchName}`, 'core', `${this.repository.owner}/${this.repository.repo}`);
-        }
-        // see if newBranchName exists
-        if (await this.getBranchSha(targetBranchName)) {
-            // branch already exists, update it to the match the base branch
-            const branchSha = await this.updateBranchSha(targetBranchName, baseBranchSha);
-            this.logger.debug(`Updated ${targetBranchName} to match ${baseBranchName} at ${branchSha}`);
-            return branchSha;
-        }
-        else {
-            // branch does not exist, create a new branch from the base branch
-            const branchSha = await this.createNewBranch(targetBranchName, baseBranchSha);
-            this.logger.debug(`Forked ${targetBranchName} from ${baseBranchName} at ${branchSha}`);
-            return branchSha;
-        }
-    }
-    /**
-     * Helper to create a new branch from a given SHA.
-     * @param {string} branchName The new branch name
-     * @param {string} branchSha The SHA of the branch
-     * @returns {string} The SHA of the new branch
-     */
-    async createNewBranch(branchName, branchSha) {
-        this.logger.debug(`Creating new branch: ${branchName} at ${branchSha}`);
-        const { data: { object: { sha }, }, } = await this.octokit.git.createRef({
-            owner: this.repository.owner,
-            repo: this.repository.repo,
-            ref: `refs/heads/${branchName}`,
-            sha: branchSha,
-        });
-        this.logger.debug(`New branch: ${branchName} at ${sha}`);
-        return sha;
-    }
-    async updateBranchSha(branchName, branchSha) {
-        this.logger.debug(`Updating branch ${branchName} to ${branchSha}`);
-        const { data: { object: { sha }, }, } = await this.octokit.git.updateRef({
-            owner: this.repository.owner,
-            repo: this.repository.repo,
-            ref: `heads/${branchName}`,
-            sha: branchSha,
-            force: true,
-        });
-        this.logger.debug(`Updated branch: ${branchName} to ${sha}`);
-        return sha;
+        return await this.gitHubApi.createFileOnNewBranch(filename, contents, newBranchName, baseBranchName);
     }
 }
 exports.GitHub = GitHub;
@@ -48166,7 +48368,7 @@ Object.defineProperty(exports, "GitHub", ({ enumerable: true, get: function () {
 exports.configSchema = __nccwpck_require__(38623);
 exports.manifestSchema = __nccwpck_require__(45314);
 // x-release-please-start-version
-exports.VERSION = '17.1.3';
+exports.VERSION = '17.5.2';
 // x-release-please-end
 //# sourceMappingURL=index.js.map
 
@@ -48216,6 +48418,7 @@ exports.DEFAULT_SNAPSHOT_LABELS = ['autorelease: snapshot'];
 exports.SNOOZE_LABEL = 'autorelease: snooze';
 const DEFAULT_RELEASE_SEARCH_DEPTH = 400;
 const DEFAULT_COMMIT_SEARCH_DEPTH = 500;
+const DEFAULT_COMMIT_BATCH_SIZE = 10;
 exports.MANIFEST_PULL_REQUEST_TITLE_PATTERN = 'chore: release ${branch}';
 class Manifest {
     /**
@@ -48278,6 +48481,8 @@ class Manifest {
             (manifestOptions === null || manifestOptions === void 0 ? void 0 : manifestOptions.releaseSearchDepth) || DEFAULT_RELEASE_SEARCH_DEPTH;
         this.commitSearchDepth =
             (manifestOptions === null || manifestOptions === void 0 ? void 0 : manifestOptions.commitSearchDepth) || DEFAULT_COMMIT_SEARCH_DEPTH;
+        this.commitBatchSize =
+            (manifestOptions === null || manifestOptions === void 0 ? void 0 : manifestOptions.commitBatchSize) || DEFAULT_COMMIT_BATCH_SIZE;
         this.logger = (_b = manifestOptions === null || manifestOptions === void 0 ? void 0 : manifestOptions.logger) !== null && _b !== void 0 ? _b : logger_1.logger;
         this.plugins = ((manifestOptions === null || manifestOptions === void 0 ? void 0 : manifestOptions.plugins) || []).map(pluginType => (0, factory_1.buildPlugin)({
             type: pluginType,
@@ -48439,6 +48644,7 @@ class Manifest {
         const commitGenerator = this.github.mergeCommitIterator(this.targetBranch, {
             maxResults: this.commitSearchDepth,
             backfillFiles: true,
+            batchSize: this.commitBatchSize,
         });
         const releaseShas = new Set(Object.values(releaseShasByPath));
         this.logger.debug(releaseShas);
@@ -48827,6 +49033,7 @@ class Manifest {
                         path,
                         pullRequest,
                         draft: (_a = config.draft) !== null && _a !== void 0 ? _a : this.draft,
+                        forceTag: config.forceTag,
                         prerelease: config.prerelease &&
                             (!!release.tag.version.preRelease ||
                                 release.tag.version.major === 0),
@@ -48929,6 +49136,7 @@ class Manifest {
         const githubRelease = await this.github.createRelease(release, {
             draft: release.draft,
             prerelease: release.prerelease,
+            forceTag: release.forceTag,
         });
         return {
             ...githubRelease,
@@ -48993,10 +49201,12 @@ function extractReleaserConfig(config) {
         changelogSections: config['changelog-sections'],
         changelogPath: config['changelog-path'],
         changelogHost: config['changelog-host'],
+        includeCommitAuthors: config['include-commit-authors'],
         releaseAs: config['release-as'],
         skipGithubRelease: config['skip-github-release'],
         skipChangelog: config['skip-changelog'],
         draft: config.draft,
+        forceTag: config['force-tag-creation'],
         prerelease: config.prerelease,
         draftPullRequest: config['draft-pull-request'],
         component: config['component'],
@@ -49005,6 +49215,7 @@ function extractReleaserConfig(config) {
         extraFiles: config['extra-files'],
         includeComponentInTag: config['include-component-in-tag'],
         includeVInTag: config['include-v-in-tag'],
+        includeVInReleaseName: config['include-v-in-release-name'],
         changelogType: config['changelog-type'],
         pullRequestTitlePattern: config['pull-request-title-pattern'],
         pullRequestHeader: config['pull-request-header'],
@@ -49062,6 +49273,7 @@ async function parseConfig(github, configFile, branch, onlyPath, releaseAs) {
         extraLabels: configExtraLabel === null || configExtraLabel === void 0 ? void 0 : configExtraLabel.split(','),
         releaseSearchDepth: config['release-search-depth'],
         commitSearchDepth: config['commit-search-depth'],
+        commitBatchSize: config['commit-batch-size'],
         sequentialCalls: config['sequential-calls'],
     };
     return { config: repositoryConfig, options: manifestOptions };
@@ -49232,7 +49444,7 @@ async function latestReleaseVersion(github, targetBranch, releaseFilter, config,
     return candidateTagVersion.sort((a, b) => b.compare(a))[0];
 }
 function mergeReleaserConfig(defaultConfig, pathConfig) {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _0, _1, _2, _3, _4, _5, _6, _7, _8;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _0, _1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11;
     return {
         releaseType: (_b = (_a = pathConfig.releaseType) !== null && _a !== void 0 ? _a : defaultConfig.releaseType) !== null && _b !== void 0 ? _b : 'node',
         bumpMinorPreMajor: (_c = pathConfig.bumpMinorPreMajor) !== null && _c !== void 0 ? _c : defaultConfig.bumpMinorPreMajor,
@@ -49243,29 +49455,32 @@ function mergeReleaserConfig(defaultConfig, pathConfig) {
         changelogPath: (_h = pathConfig.changelogPath) !== null && _h !== void 0 ? _h : defaultConfig.changelogPath,
         changelogHost: (_j = pathConfig.changelogHost) !== null && _j !== void 0 ? _j : defaultConfig.changelogHost,
         changelogType: (_k = pathConfig.changelogType) !== null && _k !== void 0 ? _k : defaultConfig.changelogType,
-        releaseAs: (_l = pathConfig.releaseAs) !== null && _l !== void 0 ? _l : defaultConfig.releaseAs,
-        skipGithubRelease: (_m = pathConfig.skipGithubRelease) !== null && _m !== void 0 ? _m : defaultConfig.skipGithubRelease,
-        skipChangelog: (_o = pathConfig.skipChangelog) !== null && _o !== void 0 ? _o : defaultConfig.skipChangelog,
-        draft: (_p = pathConfig.draft) !== null && _p !== void 0 ? _p : defaultConfig.draft,
-        draftPullRequest: (_q = pathConfig.draftPullRequest) !== null && _q !== void 0 ? _q : defaultConfig.draftPullRequest,
-        prerelease: (_r = pathConfig.prerelease) !== null && _r !== void 0 ? _r : defaultConfig.prerelease,
-        component: (_s = pathConfig.component) !== null && _s !== void 0 ? _s : defaultConfig.component,
-        packageName: (_t = pathConfig.packageName) !== null && _t !== void 0 ? _t : defaultConfig.packageName,
-        versionFile: (_u = pathConfig.versionFile) !== null && _u !== void 0 ? _u : defaultConfig.versionFile,
-        extraFiles: (_v = pathConfig.extraFiles) !== null && _v !== void 0 ? _v : defaultConfig.extraFiles,
-        includeComponentInTag: (_w = pathConfig.includeComponentInTag) !== null && _w !== void 0 ? _w : defaultConfig.includeComponentInTag,
-        includeVInTag: (_x = pathConfig.includeVInTag) !== null && _x !== void 0 ? _x : defaultConfig.includeVInTag,
-        tagSeparator: (_y = pathConfig.tagSeparator) !== null && _y !== void 0 ? _y : defaultConfig.tagSeparator,
-        pullRequestTitlePattern: (_z = pathConfig.pullRequestTitlePattern) !== null && _z !== void 0 ? _z : defaultConfig.pullRequestTitlePattern,
-        pullRequestHeader: (_0 = pathConfig.pullRequestHeader) !== null && _0 !== void 0 ? _0 : defaultConfig.pullRequestHeader,
-        pullRequestFooter: (_1 = pathConfig.pullRequestFooter) !== null && _1 !== void 0 ? _1 : defaultConfig.pullRequestFooter,
-        componentNoSpace: (_2 = pathConfig.componentNoSpace) !== null && _2 !== void 0 ? _2 : defaultConfig.componentNoSpace,
-        separatePullRequests: (_3 = pathConfig.separatePullRequests) !== null && _3 !== void 0 ? _3 : defaultConfig.separatePullRequests,
-        skipSnapshot: (_4 = pathConfig.skipSnapshot) !== null && _4 !== void 0 ? _4 : defaultConfig.skipSnapshot,
-        initialVersion: (_5 = pathConfig.initialVersion) !== null && _5 !== void 0 ? _5 : defaultConfig.initialVersion,
-        extraLabels: (_6 = pathConfig.extraLabels) !== null && _6 !== void 0 ? _6 : defaultConfig.extraLabels,
-        excludePaths: (_7 = pathConfig.excludePaths) !== null && _7 !== void 0 ? _7 : defaultConfig.excludePaths,
-        dateFormat: (_8 = pathConfig.dateFormat) !== null && _8 !== void 0 ? _8 : defaultConfig.dateFormat,
+        includeCommitAuthors: (_l = pathConfig.includeCommitAuthors) !== null && _l !== void 0 ? _l : defaultConfig.includeCommitAuthors,
+        releaseAs: (_m = pathConfig.releaseAs) !== null && _m !== void 0 ? _m : defaultConfig.releaseAs,
+        skipGithubRelease: (_o = pathConfig.skipGithubRelease) !== null && _o !== void 0 ? _o : defaultConfig.skipGithubRelease,
+        skipChangelog: (_p = pathConfig.skipChangelog) !== null && _p !== void 0 ? _p : defaultConfig.skipChangelog,
+        draft: (_q = pathConfig.draft) !== null && _q !== void 0 ? _q : defaultConfig.draft,
+        forceTag: (_r = pathConfig.forceTag) !== null && _r !== void 0 ? _r : defaultConfig.forceTag,
+        draftPullRequest: (_s = pathConfig.draftPullRequest) !== null && _s !== void 0 ? _s : defaultConfig.draftPullRequest,
+        prerelease: (_t = pathConfig.prerelease) !== null && _t !== void 0 ? _t : defaultConfig.prerelease,
+        component: (_u = pathConfig.component) !== null && _u !== void 0 ? _u : defaultConfig.component,
+        packageName: (_v = pathConfig.packageName) !== null && _v !== void 0 ? _v : defaultConfig.packageName,
+        versionFile: (_w = pathConfig.versionFile) !== null && _w !== void 0 ? _w : defaultConfig.versionFile,
+        extraFiles: (_x = pathConfig.extraFiles) !== null && _x !== void 0 ? _x : defaultConfig.extraFiles,
+        includeComponentInTag: (_y = pathConfig.includeComponentInTag) !== null && _y !== void 0 ? _y : defaultConfig.includeComponentInTag,
+        includeVInTag: (_z = pathConfig.includeVInTag) !== null && _z !== void 0 ? _z : defaultConfig.includeVInTag,
+        includeVInReleaseName: (_0 = pathConfig.includeVInReleaseName) !== null && _0 !== void 0 ? _0 : defaultConfig.includeVInReleaseName,
+        tagSeparator: (_1 = pathConfig.tagSeparator) !== null && _1 !== void 0 ? _1 : defaultConfig.tagSeparator,
+        pullRequestTitlePattern: (_2 = pathConfig.pullRequestTitlePattern) !== null && _2 !== void 0 ? _2 : defaultConfig.pullRequestTitlePattern,
+        pullRequestHeader: (_3 = pathConfig.pullRequestHeader) !== null && _3 !== void 0 ? _3 : defaultConfig.pullRequestHeader,
+        pullRequestFooter: (_4 = pathConfig.pullRequestFooter) !== null && _4 !== void 0 ? _4 : defaultConfig.pullRequestFooter,
+        componentNoSpace: (_5 = pathConfig.componentNoSpace) !== null && _5 !== void 0 ? _5 : defaultConfig.componentNoSpace,
+        separatePullRequests: (_6 = pathConfig.separatePullRequests) !== null && _6 !== void 0 ? _6 : defaultConfig.separatePullRequests,
+        skipSnapshot: (_7 = pathConfig.skipSnapshot) !== null && _7 !== void 0 ? _7 : defaultConfig.skipSnapshot,
+        initialVersion: (_8 = pathConfig.initialVersion) !== null && _8 !== void 0 ? _8 : defaultConfig.initialVersion,
+        extraLabels: (_9 = pathConfig.extraLabels) !== null && _9 !== void 0 ? _9 : defaultConfig.extraLabels,
+        excludePaths: (_10 = pathConfig.excludePaths) !== null && _10 !== void 0 ? _10 : defaultConfig.excludePaths,
+        dateFormat: (_11 = pathConfig.dateFormat) !== null && _11 !== void 0 ? _11 : defaultConfig.dateFormat,
     };
 }
 /**
@@ -49737,29 +49952,130 @@ const plugin_1 = __nccwpck_require__(31651);
 class FeatureFlagPlugin extends plugin_1.ManifestPlugin {
     constructor(github, targetBranch, repositoryConfig) {
         super(github, targetBranch, repositoryConfig);
-        // Build set of enabled flags from environment variables only
+        this.featureFlagFile = process.env.FEATURE_FLAG_FILE || '.env.production';
+        // Build set of enabled flags from environment variables and env file
         this.enabledFlags = new Set();
-        this.previouslyEnabledFlags = new Set();
         // Load from environment variables
         if (typeof process !== 'undefined' && process.env) {
             for (const [key, value] of Object.entries(process.env)) {
-                if (key.startsWith('FEATURE_')) {
-                    if (value === 'true') {
-                        this.enabledFlags.add(key);
-                    }
-                    // Track all feature flags seen (for detecting newly enabled ones)
-                    if (value === 'false') {
-                        this.previouslyEnabledFlags.add(key);
-                    }
+                if (key.startsWith('FEATURE_') && value === 'true') {
+                    this.enabledFlags.add(key);
                 }
             }
         }
+        // Load from feature flag file at HEAD
+        const headFlags = this.readEnabledFlagsFromRef('HEAD');
+        for (const flag of headFlags) {
+            this.enabledFlags.add(flag);
+        }
         console.log(`[FeatureFlagPlugin] Initialized with enabled flags: ${Array.from(this.enabledFlags).join(', ') || 'none'}`);
+    }
+    /**
+     * Parse enabled FEATURE_* flags from env-style file content
+     */
+    parseEnabledFlagsFromEnv(content) {
+        const enabled = new Set();
+        for (const line of content.split('\n')) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) {
+                continue;
+            }
+            const match = trimmed.match(/^(FEATURE_[A-Z0-9_]+)\s*=\s*(.+)$/i);
+            if (!match) {
+                continue;
+            }
+            const key = match[1];
+            const rawValue = match[2].trim();
+            const normalizedValue = rawValue
+                .replace(/^['"]|['"]$/g, '')
+                .toLowerCase();
+            if (normalizedValue === 'true') {
+                enabled.add(key);
+            }
+        }
+        return enabled;
+    }
+    /**
+     * Read enabled flags from the feature flag file at a git ref
+     */
+    readEnabledFlagsFromRef(ref) {
+        try {
+            const output = (0, child_process_1.execSync)(`git show ${ref}:${this.featureFlagFile}`, {
+                encoding: 'utf-8',
+                stdio: ['pipe', 'pipe', 'ignore'],
+            });
+            return this.parseEnabledFlagsFromEnv(output);
+        }
+        catch (_a) {
+            return new Set();
+        }
+    }
+    /**
+     * Get latest release tag reachable from HEAD
+     */
+    getLatestTag() {
+        try {
+            const tag = (0, child_process_1.execSync)('git describe --tags --abbrev=0', {
+                encoding: 'utf-8',
+                stdio: ['pipe', 'pipe', 'ignore'],
+            }).trim();
+            return tag || undefined;
+        }
+        catch (_a) {
+            return undefined;
+        }
+    }
+    /**
+     * Detect flags that were disabled (or absent) at last release and are enabled now.
+     */
+    getNewlyEnabledFlags() {
+        const latestTag = this.getLatestTag();
+        if (!latestTag) {
+            return [];
+        }
+        const enabledAtHead = this.readEnabledFlagsFromRef('HEAD');
+        const enabledAtLatestTag = this.readEnabledFlagsFromRef(latestTag);
+        return Array.from(enabledAtHead).filter(flag => !enabledAtLatestTag.has(flag));
+    }
+    /**
+     * Add historical commits for newly enabled flags to current commit set.
+     */
+    injectHistoricalCommitsForNewlyEnabledFlags(commitsByPath) {
+        const newlyEnabledFlags = this.getNewlyEnabledFlags();
+        if (newlyEnabledFlags.length === 0) {
+            return;
+        }
+        console.log(`[FeatureFlagPlugin] Newly enabled flags: ${newlyEnabledFlags.join(', ')}`);
+        const historicalCommits = this.findHistoricalCommits(newlyEnabledFlags);
+        if (historicalCommits.length === 0) {
+            return;
+        }
+        const existingShas = new Set();
+        for (const commits of Object.values(commitsByPath)) {
+            for (const commit of commits) {
+                if (commit.sha) {
+                    existingShas.add(commit.sha);
+                }
+            }
+        }
+        const dedupedHistoricalCommits = historicalCommits.filter(commit => {
+            return !!commit.sha && !existingShas.has(commit.sha);
+        });
+        if (dedupedHistoricalCommits.length === 0) {
+            return;
+        }
+        const targetPath = commitsByPath['.'] ? '.' : Object.keys(commitsByPath)[0];
+        if (!targetPath) {
+            return;
+        }
+        commitsByPath[targetPath].push(...dedupedHistoricalCommits);
+        console.log(`[FeatureFlagPlugin] Injected ${dedupedHistoricalCommits.length} historical commits into path ${targetPath}`);
     }
     /**
      * Filter commits before strategies use them for changelog generation
      */
     async preconfigure(strategiesByPath, commitsByPath, _releasesByPath) {
+        this.injectHistoricalCommitsForNewlyEnabledFlags(commitsByPath);
         // Filter commits for each path IN PLACE
         for (const [path, commits] of Object.entries(commitsByPath)) {
             const originalCount = commits.length;
@@ -49781,11 +50097,15 @@ class FeatureFlagPlugin extends plugin_1.ManifestPlugin {
      */
     findHistoricalCommits(flags) {
         const commits = [];
+        const latestTag = this.getLatestTag();
+        if (!latestTag) {
+            return commits;
+        }
         for (const flag of flags) {
             try {
                 // Search for all commits mentioning this feature flag
                 const grepPattern = `Feature-Flag: ${flag}`;
-                const output = (0, child_process_1.execSync)(`git log --all --grep="${grepPattern}" --format="%H|%s|%b|%an|%ae"`, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] });
+                const output = (0, child_process_1.execSync)(`git log ${latestTag} --grep="${grepPattern}" --regexp-ignore-case --format="%H|%s|%b|%an|%ae"`, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] });
                 if (output.trim()) {
                     const lines = output.trim().split('\n');
                     for (const line of lines) {
@@ -51453,7 +51773,7 @@ const DEFAULT_CHANGELOG_PATH = 'CHANGELOG.md';
  */
 class BaseStrategy {
     constructor(options) {
-        var _a, _b, _c;
+        var _a, _b, _c, _d;
         this.logger = (_a = options.logger) !== null && _a !== void 0 ? _a : logger_1.logger;
         this.path = options.path || manifest_1.ROOT_PROJECT_PATH;
         this.github = options.github;
@@ -51476,6 +51796,7 @@ class BaseStrategy {
             options.changelogNotes || new default_2.DefaultChangelogNotes(options);
         this.includeComponentInTag = (_b = options.includeComponentInTag) !== null && _b !== void 0 ? _b : true;
         this.includeVInTag = (_c = options.includeVInTag) !== null && _c !== void 0 ? _c : true;
+        this.includeVInReleaseName = (_d = options.includeVInReleaseName) !== null && _d !== void 0 ? _d : true;
         this.pullRequestTitlePattern = options.pullRequestTitlePattern;
         this.pullRequestHeader = options.pullRequestHeader;
         this.pullRequestFooter = options.pullRequestFooter;
@@ -51484,6 +51805,7 @@ class BaseStrategy {
         this.initialVersion = options.initialVersion;
         this.extraLabels = options.extraLabels || [];
         this.dateFormat = options.dateFormat || generic_1.DEFAULT_DATE_FORMAT;
+        this.includeCommitAuthors = options.includeCommitAuthors;
     }
     /**
      * Return the component for this strategy. This may be a computed field.
@@ -51536,6 +51858,7 @@ class BaseStrategy {
             targetBranch: this.targetBranch,
             changelogSections: this.changelogSections,
             commits: commits,
+            includeCommitAuthors: this.includeCommitAuthors,
         });
     }
     async buildPullRequestBody(component, newVersion, releaseNotesBody, _conventionalCommits, _latestRelease, pullRequestHeader, pullRequestFooter) {
@@ -51836,9 +52159,10 @@ class BaseStrategy {
             return;
         }
         const tag = new tag_name_1.TagName(version, this.includeComponentInTag ? component : undefined, this.tagSeparator, this.includeVInTag);
+        const versionPrefix = this.includeVInReleaseName ? 'v' : '';
         const releaseName = component && this.includeComponentInTag
-            ? `${component}: v${version.toString()}`
-            : `v${version.toString()}`;
+            ? `${component}: ${versionPrefix}${version.toString()}`
+            : `${versionPrefix}${version.toString()}`;
         return {
             name: releaseName,
             tag,
@@ -52669,6 +52993,7 @@ class JavaYoshiMonoRepo extends java_1.Java {
         const buildFilesSearch = this.github.findFilesByFilenameAndRef('build.gradle', this.targetBranch, this.path);
         const dependenciesSearch = this.github.findFilesByFilenameAndRef('dependencies.properties', this.targetBranch, this.path);
         const readmeFilesSearch = this.github.findFilesByFilenameAndRef('README.md', this.targetBranch, this.path);
+        const versionFilesSearch = this.github.findFilesByFilenameAndRef('Version.java', this.targetBranch, this.path);
         const pomFiles = await pomFilesSearch;
         pomFiles.forEach(path => {
             updates.push({
@@ -52707,6 +53032,18 @@ class JavaYoshiMonoRepo extends java_1.Java {
         });
         const readmeFiles = await readmeFilesSearch;
         readmeFiles.forEach(path => {
+            updates.push({
+                path: this.addPath(path),
+                createIfMissing: false,
+                updater: new java_update_1.JavaUpdate({
+                    version,
+                    versionsMap,
+                    isSnapshot: options.isSnapshot,
+                }),
+            });
+        });
+        const versionFiles = await versionFilesSearch;
+        versionFiles.forEach(path => {
             updates.push({
                 path: this.addPath(path),
                 createIfMissing: false,
@@ -59651,6 +59988,7 @@ class PrereleaseVersioningStrategy extends default_1.DefaultVersioningStrategy {
     constructor(options = {}) {
         super(options);
         this.prereleaseType = options.prereleaseType;
+        this.prerelease = options.prerelease === true;
     }
     determineReleaseType(version, commits) {
         // iterate through list of commits and find biggest commit type
@@ -59670,23 +60008,31 @@ class PrereleaseVersioningStrategy extends default_1.DefaultVersioningStrategy {
                 features++;
             }
         }
+        let bumpedVersionUpdater;
         if (breaking > 0) {
             if (version.isPreMajor && this.bumpMinorPreMajor) {
-                return new PrereleaseMinorVersionUpdate(this.prereleaseType);
+                bumpedVersionUpdater = new PrereleaseMinorVersionUpdate(this.prereleaseType);
             }
             else {
-                return new PrereleaseMajorVersionUpdate(this.prereleaseType);
+                bumpedVersionUpdater = new PrereleaseMajorVersionUpdate(this.prereleaseType);
             }
         }
         else if (features > 0) {
             if (version.isPreMajor && this.bumpPatchForMinorPreMajor) {
-                return new PrereleasePatchVersionUpdate(this.prereleaseType);
+                bumpedVersionUpdater = new PrereleasePatchVersionUpdate(this.prereleaseType);
             }
             else {
-                return new PrereleaseMinorVersionUpdate(this.prereleaseType);
+                bumpedVersionUpdater = new PrereleaseMinorVersionUpdate(this.prereleaseType);
             }
         }
-        return new PrereleasePatchVersionUpdate(this.prereleaseType);
+        else {
+            bumpedVersionUpdater = new PrereleasePatchVersionUpdate(this.prereleaseType);
+        }
+        if (!this.prerelease) {
+            const bumpedVersion = bumpedVersionUpdater.bump(version);
+            return new versioning_strategy_1.CustomVersionUpdate(version_1.Version.parse(`${bumpedVersion.major}.${bumpedVersion.minor}.${bumpedVersion.patch}`).toString());
+        }
+        return bumpedVersionUpdater;
     }
 }
 exports.PrereleaseVersioningStrategy = PrereleaseVersioningStrategy;
@@ -105579,7 +105925,7 @@ exports.JSONPath = JSONPath;
 /***/ ((module) => {
 
 "use strict";
-module.exports = {"i8":"17.1.3"};
+module.exports = {"i8":"17.5.2"};
 
 /***/ }),
 
@@ -105587,7 +105933,7 @@ module.exports = {"i8":"17.1.3"};
 /***/ ((module) => {
 
 "use strict";
-module.exports = JSON.parse('{"$schema":"http://json-schema.org/draft-07/schema#","title":"release-please manifest config schema","description":"Schema for defining manifest config file","type":"object","additionalProperties":false,"definitions":{"ReleaserConfigOptions":{"type":"object","properties":{"release-type":{"description":"The strategy to use for this component.","type":"string"},"bump-minor-pre-major":{"description":"Breaking changes only bump semver minor if version < 1.0.0","type":"boolean"},"bump-patch-for-minor-pre-major":{"description":"Feature changes only bump semver patch if version < 1.0.0","type":"boolean"},"prerelease-type":{"description":"Configuration option for the prerelease versioning strategy. If prerelease strategy used and type set, will set the prerelease part of the version to the provided value in case prerelease part is not present.","type":"string"},"versioning":{"description":"Versioning strategy. Defaults to `default`","type":"string"},"changelog-sections":{"description":"Override the Changelog configuration sections","type":"array","items":{"type":"object","properties":{"type":{"description":"Semantic commit type (e.g. `feat`, `chore`)","type":"string"},"section":{"description":"Changelog section title","type":"string"},"hidden":{"description":"Skip displaying this type of commit. Defaults to `false`.","type":"boolean"}},"required":["type","section"]}},"release-as":{"description":"[DEPRECATED] Override the next version of this package. Consider using a `Release-As` commit instead.","type":"string"},"skip-github-release":{"description":"Skip tagging GitHub releases for this package. Release-Please still requires releases to be tagged, so this option should only be used if you have existing infrastructure to tag these releases.Defaults to `false`.","type":"boolean"},"skip-changelog":{"description":"Skip generating a changelog for this package. Defaults to `false`.","type":"boolean"},"draft":{"description":"Create the GitHub release in draft mode. Defaults to `false`.","type":"boolean"},"prerelease":{"description":"Create the GitHub release as prerelease. Defaults to `false`.","type":"boolean"},"draft-pull-request":{"description":"Open the release pull request in draft mode. Defaults to `false`.","type":"boolean"},"extra-label":{"description":"Comma-separated list of labels to add to a newly opened pull request","type":"string"},"include-component-in-tag":{"description":"When tagging a release, include the component name as part of the tag. Defaults to `true`.","type":"boolean"},"include-v-in-tag":{"description":"When tagging a release, include `v` in the tag. Defaults to `false`.","type":"boolean"},"changelog-type":{"description":"The type of changelog to use. Defaults to `default`.","type":"string","enum":["default","github"]},"changelog-host":{"description":"Generate changelog links to this GitHub host. Useful for running against GitHub Enterprise.","type":"string"},"changelog-path":{"description":"Path to the file that tracks release note changes. Defaults to `CHANGELOG.md`.","type":"string"},"pull-request-title-pattern":{"description":"Customize the release pull request title.","type":"string"},"pull-request-header":{"description":"Customize the release pull request header.","type":"string"},"pull-request-footer":{"description":"Customize the release pull request footer.","type":"string"},"separate-pull-requests":{"description":"Open a separate release pull request for each component. Defaults to `false`.","type":"boolean"},"always-update":{"description":"Always update the pull request with the latest changes. Defaults to `false`.","type":"boolean"},"tag-separator":{"description":"Customize the separator between the component and version in the GitHub tag.","type":"string"},"date-format":{"description":"Date format given as a strftime expression for the generic strategy.","type":"string"},"extra-files":{"description":"Specify extra generic files to replace versions.","type":"array","items":{"anyOf":[{"description":"The path to the file. The `Generic` updater uses annotations to replace versions.","type":"string"},{"description":"An extra JSON, YAML, or TOML file with a targeted update via jsonpath.","type":"object","properties":{"type":{"description":"The file format type.","enum":["json","toml","yaml"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"},"jsonpath":{"description":"The jsonpath to the version entry in the file.","type":"string"}},"required":["type","path","jsonpath"]},{"description":"An extra XML file with a targeted update via xpath.","type":"object","properties":{"type":{"description":"The file format type.","enum":["xml"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"},"xpath":{"description":"The xpath to the version entry in the file.","type":"string"}},"required":["type","path","xpath"]},{"description":"An extra pom.xml file.","type":"object","properties":{"type":{"description":"The file format type.","enum":["pom"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"}},"required":["type","path"]},{"description":"An extra arbitrary file that includes release-please generic updater\'s annotation.","type":"object","properties":{"type":{"description":"The file format type.","enum":["generic"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"}},"required":["type","path"]}]}},"exclude-paths":{"description":"Path of commits to be excluded from parsing. If all files from commit belong to one of the paths it will be skipped","type":"array","items":{"type":"string"}},"version-file":{"description":"Path to the specialize version file. Used by `ruby` and `simple` strategies.","type":"string"},"snapshot-label":{"description":"Label to add to snapshot pull request. Used by `java` strategies.","type":"string"},"skip-snapshot":{"description":"If set, do not propose snapshot pull requests. Used by `java` strategies.","type":"boolean"},"initial-version":{"description":"Releases the initial library with a specified version","type":"string"},"component-no-space":{"description":"release-please automatically adds ` ` (space) in front of parsed ${component}. This option indicates whether that behaviour should be disabled. Defaults to `false`","type":"boolean"}}}},"allOf":[{"$ref":"#/definitions/ReleaserConfigOptions"},{"properties":{"$schema":{"description":"Path to the release-please manifest config schema","type":"string","format":"uri-reference"},"packages":{"description":"Per-path component configuration.","type":"object","additionalProperties":{"$ref":"#/definitions/ReleaserConfigOptions"}},"bootstrap-sha":{"description":"For the initial release of a library, only consider as far back as this commit SHA. This is an uncommon use case and should generally be avoided.","type":"string"},"last-release-sha":{"description":"For any release, only consider as far back as this commit SHA. This is an uncommon use case and should generally be avoided.","type":"string"},"always-link-local":{"description":"When using the `node-workspace` plugin, force all local dependencies to be linked.","type":"boolean"},"plugins":{"description":"Plugins to apply to pull requests. Plugins can be added to perform extra release processing that cannot be achieved by an individual release strategy.","type":"array","items":{"anyOf":[{"description":"The plugin name for plugins that do not require other options.","type":"string"},{"description":"Configuration for the `linked-versions` plugin.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["linked-versions"]},"groupName":{"description":"The name of the group of components.","type":"string"},"components":{"description":"List of component names that are part of this group.","type":"array","items":{"type":"string"}},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"specialWords":{"description":"Words that sentence casing logic will not be applied to","type":"array","items":{"type":"string"}}},"required":["type","groupName","components"]},{"description":"Configuration for various `workspace` plugins.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["cargo-workspace","maven-workspace"]},"updateAllPackages":{"description":"Whether to force updating all packages regardless of the dependency tree. Defaults to `false`.","type":"boolean"},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"considerAllArtifacts":{"description":"Whether to analyze all packages in the workspace for cross-component version bumping. This currently only works for the maven-workspace plugin. Defaults to `true`.","type":"boolean"}}},{"description":"Configuration for various `workspace` plugins.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["node-workspace"]},"updateAllPackages":{"description":"Whether to force updating all packages regardless of the dependency tree. Defaults to `false`.","type":"boolean"},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"considerAllArtifacts":{"description":"Whether to analyze all packages in the workspace for cross-component version bumping. This currently only works for the maven-workspace plugin. Defaults to `true`.","type":"boolean"},"updatePeerDependencies":{"description":"Also bump peer dependency versions if they are modified. Defaults to `false`.","type":"boolean"}}},{"description":"Configuration for various `group-priority` plugin","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["group-priority"]},"groups":{"description":"Group names ordered with highest priority first.","type":"array","items":{"type":"string"}}}},{"description":"Other plugins","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string"}}}]}},"signoff":{"description":"Text to be used as Signed-off-by in the commit.","type":"string"},"group-pull-request-title-pattern":{"description":"When grouping multiple release pull requests use this pattern for the title.","type":"string"},"release-search-depth":{"description":"When considering previously releases, only look this deep.","type":"number"},"commit-search-depth":{"description":"When considering commit history, only look this many commits deep.","type":"number"},"sequential-calls":{"description":"Whether to open pull requests/releases sequentially rather than concurrently. If you have many components, you may want to set this to avoid secondary rate limits.","type":"boolean"},"label":{"description":"Comma-separated list of labels to add to newly opened pull request. These are used to identify release pull requests.","type":"string"},"release-label":{"description":"Comma-separated list of labels to add to a pull request that has been released/tagged","type":"string"},"component-no-space":{"description":"release-please automatically adds ` ` (space) in front of parsed ${component}. This option indicates whether that behaviour should be disabled. Defaults to `false`","type":"boolean"}},"required":["packages"]}],"properties":{"$schema":true,"packages":true,"bootstrap-sha":true,"last-release-sha":true,"always-link-local":true,"plugins":true,"signoff":true,"group-pull-request-title-pattern":true,"release-search-depth":true,"commit-search-depth":true,"sequential-calls":true,"release-type":true,"bump-minor-pre-major":true,"bump-patch-for-minor-pre-major":true,"versioning":true,"changelog-sections":true,"release-as":true,"skip-github-release":true,"skip-changelog":true,"draft":true,"prerelease":true,"draft-pull-request":true,"label":true,"release-label":true,"extra-label":true,"include-component-in-tag":true,"include-v-in-tag":true,"changelog-type":true,"changelog-host":true,"changelog-path":true,"pull-request-title-pattern":true,"pull-request-header":true,"pull-request-footer":true,"separate-pull-requests":true,"always-update":true,"tag-separator":true,"date-format":true,"extra-files":true,"version-file":true,"snapshot-label":true,"initial-version":true,"exclude-paths":true,"component-no-space":false}}');
+module.exports = JSON.parse('{"$schema":"http://json-schema.org/draft-07/schema#","title":"release-please manifest config schema","description":"Schema for defining manifest config file","type":"object","additionalProperties":false,"definitions":{"ReleaserConfigOptions":{"type":"object","properties":{"release-type":{"description":"The strategy to use for this component.","type":"string"},"bump-minor-pre-major":{"description":"Breaking changes only bump semver minor if version < 1.0.0","type":"boolean"},"bump-patch-for-minor-pre-major":{"description":"Feature changes only bump semver patch if version < 1.0.0","type":"boolean"},"prerelease-type":{"description":"Configuration option for the prerelease versioning strategy. If prerelease strategy used and type set, will set the prerelease part of the version to the provided value in case prerelease part is not present.","type":"string"},"versioning":{"description":"Versioning strategy. Defaults to `default`","type":"string"},"changelog-sections":{"description":"Override the Changelog configuration sections","type":"array","items":{"type":"object","properties":{"type":{"description":"Semantic commit type (e.g. `feat`, `chore`)","type":"string"},"section":{"description":"Changelog section title","type":"string"},"hidden":{"description":"Skip displaying this type of commit. Defaults to `false`.","type":"boolean"}},"required":["type","section"]}},"release-as":{"description":"[DEPRECATED] Override the next version of this package. Consider using a `Release-As` commit instead.","type":"string"},"skip-github-release":{"description":"Skip tagging GitHub releases for this package. Release-Please still requires releases to be tagged, so this option should only be used if you have existing infrastructure to tag these releases.Defaults to `false`.","type":"boolean"},"skip-changelog":{"description":"Skip generating a changelog for this package. Defaults to `false`.","type":"boolean"},"draft":{"description":"Create the GitHub release in draft mode. Defaults to `false`.","type":"boolean"},"force-tag-creation":{"description":"Force the creation of a Git tag for the release. This is particularly useful when `draft` is enabled, because GitHub does not create a Git tag for draft releases until they are published. This \'lazy tag creation\' causes release-please to fail to find the previous release, potentially generating incorrect changelogs. Setting this to `true` ensures the tag is created immediately. Defaults to `false`.","type":"boolean"},"prerelease":{"description":"Create the GitHub release as prerelease. Defaults to `false`.","type":"boolean"},"draft-pull-request":{"description":"Open the release pull request in draft mode. Defaults to `false`.","type":"boolean"},"extra-label":{"description":"Comma-separated list of labels to add to a newly opened pull request","type":"string"},"include-component-in-tag":{"description":"When tagging a release, include the component name as part of the tag. Defaults to `true`.","type":"boolean"},"include-v-in-tag":{"description":"When tagging a release, include `v` in the tag. Defaults to `true`.","type":"boolean"},"include-v-in-release-name":{"description":"Include `v` in the GitHub release name. Defaults to `true`.","type":"boolean"},"changelog-type":{"description":"The type of changelog to use. Defaults to `default`.","type":"string","enum":["default","github"]},"changelog-host":{"description":"Generate changelog links to this GitHub host. Useful for running against GitHub Enterprise.","type":"string"},"changelog-path":{"description":"Path to the file that tracks release note changes. Defaults to `CHANGELOG.md`.","type":"string"},"pull-request-title-pattern":{"description":"Customize the release pull request title.","type":"string"},"pull-request-header":{"description":"Customize the release pull request header.","type":"string"},"pull-request-footer":{"description":"Customize the release pull request footer.","type":"string"},"separate-pull-requests":{"description":"Open a separate release pull request for each component. Defaults to `false`.","type":"boolean"},"always-update":{"description":"Always update the pull request with the latest changes. Defaults to `false`.","type":"boolean"},"tag-separator":{"description":"Customize the separator between the component and version in the GitHub tag.","type":"string"},"date-format":{"description":"Date format given as a strftime expression for the generic strategy.","type":"string"},"extra-files":{"description":"Specify extra generic files to replace versions.","type":"array","items":{"anyOf":[{"description":"The path to the file. The `Generic` updater uses annotations to replace versions.","type":"string"},{"description":"An extra JSON, YAML, or TOML file with a targeted update via jsonpath.","type":"object","properties":{"type":{"description":"The file format type.","enum":["json","toml","yaml"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"},"jsonpath":{"description":"The jsonpath to the version entry in the file.","type":"string"}},"required":["type","path","jsonpath"]},{"description":"An extra XML file with a targeted update via xpath.","type":"object","properties":{"type":{"description":"The file format type.","enum":["xml"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"},"xpath":{"description":"The xpath to the version entry in the file.","type":"string"}},"required":["type","path","xpath"]},{"description":"An extra pom.xml file.","type":"object","properties":{"type":{"description":"The file format type.","enum":["pom"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"}},"required":["type","path"]},{"description":"An extra arbitrary file that includes release-please generic updater\'s annotation.","type":"object","properties":{"type":{"description":"The file format type.","enum":["generic"]},"path":{"description":"The path to the file.","type":"string"},"glob":{"description":"Whether to treat the path as a glob. Defaults to `false`.","type":"boolean"}},"required":["type","path"]}]}},"exclude-paths":{"description":"Path of commits to be excluded from parsing. If all files from commit belong to one of the paths it will be skipped","type":"array","items":{"type":"string"}},"version-file":{"description":"Path to the specialize version file. Used by `ruby` and `simple` strategies.","type":"string"},"snapshot-label":{"description":"Label to add to snapshot pull request. Used by `java` strategies.","type":"string"},"skip-snapshot":{"description":"If set, do not propose snapshot pull requests. Used by `java` strategies.","type":"boolean"},"initial-version":{"description":"Releases the initial library with a specified version","type":"string"},"component-no-space":{"description":"release-please automatically adds ` ` (space) in front of parsed ${component}. This option indicates whether that behaviour should be disabled. Defaults to `false`","type":"boolean"}}}},"allOf":[{"$ref":"#/definitions/ReleaserConfigOptions"},{"properties":{"$schema":{"description":"Path to the release-please manifest config schema","type":"string","format":"uri-reference"},"packages":{"description":"Per-path component configuration.","type":"object","additionalProperties":{"$ref":"#/definitions/ReleaserConfigOptions"}},"bootstrap-sha":{"description":"For the initial release of a library, only consider as far back as this commit SHA. This is an uncommon use case and should generally be avoided.","type":"string"},"last-release-sha":{"description":"For any release, only consider as far back as this commit SHA. This is an uncommon use case and should generally be avoided.","type":"string"},"always-link-local":{"description":"When using the `node-workspace` plugin, force all local dependencies to be linked.","type":"boolean"},"plugins":{"description":"Plugins to apply to pull requests. Plugins can be added to perform extra release processing that cannot be achieved by an individual release strategy.","type":"array","items":{"anyOf":[{"description":"The plugin name for plugins that do not require other options.","type":"string"},{"description":"Configuration for the `linked-versions` plugin.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["linked-versions"]},"groupName":{"description":"The name of the group of components.","type":"string"},"components":{"description":"List of component names that are part of this group.","type":"array","items":{"type":"string"}},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"specialWords":{"description":"Words that sentence casing logic will not be applied to","type":"array","items":{"type":"string"}}},"required":["type","groupName","components"]},{"description":"Configuration for various `workspace` plugins.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["cargo-workspace","maven-workspace"]},"updateAllPackages":{"description":"Whether to force updating all packages regardless of the dependency tree. Defaults to `false`.","type":"boolean"},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"considerAllArtifacts":{"description":"Whether to analyze all packages in the workspace for cross-component version bumping. This currently only works for the maven-workspace plugin. Defaults to `true`.","type":"boolean"}}},{"description":"Configuration for various `workspace` plugins.","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["node-workspace"]},"updateAllPackages":{"description":"Whether to force updating all packages regardless of the dependency tree. Defaults to `false`.","type":"boolean"},"merge":{"description":"Whether to merge in-scope pull requests into a combined release pull request. Defaults to `true`.","type":"boolean"},"considerAllArtifacts":{"description":"Whether to analyze all packages in the workspace for cross-component version bumping. This currently only works for the maven-workspace plugin. Defaults to `true`.","type":"boolean"},"updatePeerDependencies":{"description":"Also bump peer dependency versions if they are modified. Defaults to `false`.","type":"boolean"}}},{"description":"Configuration for various `group-priority` plugin","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string","enum":["group-priority"]},"groups":{"description":"Group names ordered with highest priority first.","type":"array","items":{"type":"string"}}}},{"description":"Other plugins","type":"object","properties":{"type":{"description":"The name of the plugin.","type":"string"}}}]}},"signoff":{"description":"Text to be used as Signed-off-by in the commit.","type":"string"},"group-pull-request-title-pattern":{"description":"When grouping multiple release pull requests use this pattern for the title.","type":"string"},"release-search-depth":{"description":"When considering previously releases, only look this deep.","type":"number"},"commit-search-depth":{"description":"When considering commit history, only look this many commits deep.","type":"number"},"commit-batch-size":{"description":"Number of commits to fetch per API request when searching commit history. Lower values result in more API calls but may help avoid timeouts. Defaults to 10.","type":"number"},"sequential-calls":{"description":"Whether to open pull requests/releases sequentially rather than concurrently. If you have many components, you may want to set this to avoid secondary rate limits.","type":"boolean"},"label":{"description":"Comma-separated list of labels to add to newly opened pull request. These are used to identify release pull requests.","type":"string"},"release-label":{"description":"Comma-separated list of labels to add to a pull request that has been released/tagged","type":"string"},"component-no-space":{"description":"release-please automatically adds ` ` (space) in front of parsed ${component}. This option indicates whether that behaviour should be disabled. Defaults to `false`","type":"boolean"}},"required":["packages"]}],"properties":{"$schema":true,"packages":true,"bootstrap-sha":true,"last-release-sha":true,"always-link-local":true,"plugins":true,"signoff":true,"group-pull-request-title-pattern":true,"release-search-depth":true,"commit-search-depth":true,"commit-batch-size":true,"sequential-calls":true,"release-type":true,"bump-minor-pre-major":true,"bump-patch-for-minor-pre-major":true,"versioning":true,"changelog-sections":true,"release-as":true,"skip-github-release":true,"skip-changelog":true,"draft":true,"force-tag-creation":true,"prerelease":true,"draft-pull-request":true,"label":true,"release-label":true,"extra-label":true,"include-component-in-tag":true,"include-v-in-tag":true,"include-v-in-release-name":true,"changelog-type":true,"changelog-host":true,"changelog-path":true,"pull-request-title-pattern":true,"pull-request-header":true,"pull-request-footer":true,"separate-pull-requests":true,"always-update":true,"tag-separator":true,"date-format":true,"extra-files":true,"version-file":true,"snapshot-label":true,"initial-version":true,"exclude-paths":true,"component-no-space":false}}');
 
 /***/ }),
 

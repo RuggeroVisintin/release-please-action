@@ -50167,8 +50167,11 @@ class FeatureFlagPlugin extends plugin_1.ManifestPlugin {
         try {
             const prs = await this.findMergedPullRequestsWithFeatureFlagBody(500);
             for (const pr of prs) {
-                const mergeSha = pr.mergeCommitOid || pr.sha;
+                const mergeSha = pr.mergeCommitOid ||
+                    pr.sha ||
+                    (await this.resolveMergeShaFromPullNumber(pr.number));
                 if (!mergeSha) {
+                    console.log(`[FeatureFlagPlugin] Skipping PR #${pr.number}: merge SHA is unavailable`);
                     continue;
                 }
                 const overrideMessage = this.extractOverrideMessage(pr.body || '');
@@ -50207,6 +50210,37 @@ class FeatureFlagPlugin extends plugin_1.ManifestPlugin {
             return commits;
         }
         return commits;
+    }
+    /**
+     * Resolve merge SHA for a pull request number when it is not present on PullRequest.
+     */
+    async resolveMergeShaFromPullNumber(pullNumber) {
+        var _a, _b, _c;
+        if (!pullNumber) {
+            return undefined;
+        }
+        const github = this.github;
+        const owner = (_a = github === null || github === void 0 ? void 0 : github.repository) === null || _a === void 0 ? void 0 : _a.owner;
+        const repo = (_b = github === null || github === void 0 ? void 0 : github.repository) === null || _b === void 0 ? void 0 : _b.repo;
+        const octokit = github === null || github === void 0 ? void 0 : github.octokit;
+        if (!owner || !repo || !octokit) {
+            return undefined;
+        }
+        try {
+            const response = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+                owner,
+                repo,
+                pull_number: pullNumber,
+            });
+            const mergeSha = (_c = response === null || response === void 0 ? void 0 : response.data) === null || _c === void 0 ? void 0 : _c.merge_commit_sha;
+            if (mergeSha) {
+                console.log(`[FeatureFlagPlugin] Resolved merge SHA for PR #${pullNumber}: ${mergeSha.substring(0, 7)}`);
+            }
+            return mergeSha;
+        }
+        catch (_d) {
+            return undefined;
+        }
     }
     /**
      * Find merged pull requests that mention Feature-Flag in the PR body.

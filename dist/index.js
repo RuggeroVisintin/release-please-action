@@ -50096,6 +50096,7 @@ class FeatureFlagPlugin extends plugin_1.ManifestPlugin {
      * Find historical commits for newly enabled flags
      */
     findHistoricalCommits(flags) {
+        var _a, _b, _c;
         const commits = [];
         const latestTag = this.getLatestTag();
         if (!latestTag) {
@@ -50105,28 +50106,38 @@ class FeatureFlagPlugin extends plugin_1.ManifestPlugin {
             try {
                 // Search for all commits mentioning this feature flag
                 const grepPattern = `Feature-Flag: ${flag}`;
-                const output = (0, child_process_1.execSync)(`git log ${latestTag} --grep="${grepPattern}" --regexp-ignore-case --format="%H|%s|%b|%an|%ae"`, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] });
+                const output = (0, child_process_1.execSync)(`git log ${latestTag} --grep="${grepPattern}" --regexp-ignore-case --format="%H%x1f%s%x1f%b%x1e"`, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] });
                 if (output.trim()) {
-                    const lines = output.trim().split('\n');
-                    for (const line of lines) {
-                        // Extract only sha, subject, and body; skip author name and email
-                        const parts = line.split('|');
-                        const sha = parts[0];
-                        const subject = parts[1] || '';
-                        const body = parts[2] || '';
+                    const records = output.split('\x1e');
+                    for (const record of records) {
+                        const trimmedRecord = record.trim();
+                        if (!trimmedRecord) {
+                            continue;
+                        }
+                        const parts = trimmedRecord.split('\x1f');
+                        const sha = (_a = parts[0]) === null || _a === void 0 ? void 0 : _a.trim();
+                        const subject = ((_b = parts[1]) === null || _b === void 0 ? void 0 : _b.trim()) || '';
+                        const body = parts.slice(2).join('\x1f').trim();
                         // Skip if we don't have the minimum required data
                         if (!sha || !subject) {
                             continue;
                         }
                         // Reconstruct commit message
                         const message = body ? `${subject}\n\n${body}` : subject;
+                        const effectiveMessage = this.getEffectiveMessage(message);
+                        const effectiveSubject = (_c = effectiveMessage
+                            .split('\n')
+                            .find(line => line.trim().length > 0)) === null || _c === void 0 ? void 0 : _c.trim();
+                        if (!effectiveSubject) {
+                            continue;
+                        }
                         commits.push({
                             sha,
                             message,
                             files: [],
-                            type: this.extractCommitType(subject),
-                            scope: this.extractCommitScope(subject),
-                            bareMessage: subject,
+                            type: this.extractCommitType(effectiveSubject),
+                            scope: this.extractCommitScope(effectiveSubject),
+                            bareMessage: effectiveSubject,
                             notes: [],
                             references: [],
                             breaking: false,
@@ -50159,17 +50170,8 @@ class FeatureFlagPlugin extends plugin_1.ManifestPlugin {
      * Determine if a commit should be included based on its feature flag
      */
     shouldIncludeCommit(commit) {
-        var _a, _b;
-        // Check for commit override in PR body first
-        let messageToCheck = commit.message;
-        if ((_a = commit.pullRequest) === null || _a === void 0 ? void 0 : _a.body) {
-            const overrideMessage = (commit.pullRequest.body.split('BEGIN_COMMIT_OVERRIDE')[1] || '')
-                .split('END_COMMIT_OVERRIDE')[0]
-                .trim();
-            if (overrideMessage) {
-                messageToCheck = overrideMessage;
-            }
-        }
+        var _a;
+        const messageToCheck = this.getFeatureFlagMessage(commit);
         // Extract feature flag from commit message or override
         const flagMatch = messageToCheck.match(/Feature-Flag:\s*(\w+)/i);
         if (!flagMatch) {
@@ -50178,8 +50180,36 @@ class FeatureFlagPlugin extends plugin_1.ManifestPlugin {
         }
         const flag = flagMatch[1];
         const isEnabled = this.enabledFlags.has(flag);
-        console.log(`[FeatureFlagPlugin] Commit ${(_b = commit.sha) === null || _b === void 0 ? void 0 : _b.substring(0, 7)}: Feature-Flag=${flag}, enabled=${isEnabled}`);
+        console.log(`[FeatureFlagPlugin] Commit ${(_a = commit.sha) === null || _a === void 0 ? void 0 : _a.substring(0, 7)}: Feature-Flag=${flag}, enabled=${isEnabled}`);
         return isEnabled;
+    }
+    /**
+     * Extract commit override block content from any text that may contain it.
+     */
+    extractOverrideMessage(text) {
+        var _a;
+        const match = text.match(/BEGIN_COMMIT_OVERRIDE([\s\S]*?)END_COMMIT_OVERRIDE/i);
+        const override = (_a = match === null || match === void 0 ? void 0 : match[1]) === null || _a === void 0 ? void 0 : _a.trim();
+        return override || undefined;
+    }
+    /**
+     * Return effective message for parsing commit metadata.
+     */
+    getEffectiveMessage(message) {
+        return this.extractOverrideMessage(message) || message;
+    }
+    /**
+     * Message used for feature-flag evaluation, preferring PR override when available.
+     */
+    getFeatureFlagMessage(commit) {
+        var _a;
+        if ((_a = commit.pullRequest) === null || _a === void 0 ? void 0 : _a.body) {
+            const overrideFromPr = this.extractOverrideMessage(commit.pullRequest.body);
+            if (overrideFromPr) {
+                return overrideFromPr;
+            }
+        }
+        return this.getEffectiveMessage(commit.message);
     }
 }
 exports.FeatureFlagPlugin = FeatureFlagPlugin;

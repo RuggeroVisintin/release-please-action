@@ -50043,39 +50043,44 @@ class FeatureFlagPlugin extends plugin_1.ManifestPlugin {
     injectHistoricalCommitsForNewlyEnabledFlags(commitsByPath) {
         const newlyEnabledFlags = this.getNewlyEnabledFlags();
         if (newlyEnabledFlags.length === 0) {
-            return;
+            return Promise.resolve();
         }
         console.log(`[FeatureFlagPlugin] Newly enabled flags: ${newlyEnabledFlags.join(', ')}`);
         const historicalCommits = this.findHistoricalCommits(newlyEnabledFlags);
-        if (historicalCommits.length === 0) {
-            return;
-        }
-        const existingShas = new Set();
-        for (const commits of Object.values(commitsByPath)) {
-            for (const commit of commits) {
-                if (commit.sha) {
-                    existingShas.add(commit.sha);
+        return this.findHistoricalOverridePullRequestCommits(newlyEnabledFlags).then(overrideCommits => {
+            const allHistoricalCommits = [...historicalCommits, ...overrideCommits];
+            if (allHistoricalCommits.length === 0) {
+                return;
+            }
+            const existingShas = new Set();
+            for (const commits of Object.values(commitsByPath)) {
+                for (const commit of commits) {
+                    if (commit.sha) {
+                        existingShas.add(commit.sha);
+                    }
                 }
             }
-        }
-        const dedupedHistoricalCommits = historicalCommits.filter(commit => {
-            return !!commit.sha && !existingShas.has(commit.sha);
+            const dedupedHistoricalCommits = allHistoricalCommits.filter(commit => {
+                return !!commit.sha && !existingShas.has(commit.sha);
+            });
+            if (dedupedHistoricalCommits.length === 0) {
+                return;
+            }
+            const targetPath = commitsByPath['.']
+                ? '.'
+                : Object.keys(commitsByPath)[0];
+            if (!targetPath) {
+                return;
+            }
+            commitsByPath[targetPath].push(...dedupedHistoricalCommits);
+            console.log(`[FeatureFlagPlugin] Injected ${dedupedHistoricalCommits.length} historical commits into path ${targetPath}`);
         });
-        if (dedupedHistoricalCommits.length === 0) {
-            return;
-        }
-        const targetPath = commitsByPath['.'] ? '.' : Object.keys(commitsByPath)[0];
-        if (!targetPath) {
-            return;
-        }
-        commitsByPath[targetPath].push(...dedupedHistoricalCommits);
-        console.log(`[FeatureFlagPlugin] Injected ${dedupedHistoricalCommits.length} historical commits into path ${targetPath}`);
     }
     /**
      * Filter commits before strategies use them for changelog generation
      */
     async preconfigure(strategiesByPath, commitsByPath, _releasesByPath) {
-        this.injectHistoricalCommitsForNewlyEnabledFlags(commitsByPath);
+        await this.injectHistoricalCommitsForNewlyEnabledFlags(commitsByPath);
         // Filter commits for each path IN PLACE
         for (const [path, commits] of Object.entries(commitsByPath)) {
             const originalCount = commits.length;
@@ -50149,6 +50154,76 @@ class FeatureFlagPlugin extends plugin_1.ManifestPlugin {
             catch (error) {
                 console.error(`[FeatureFlagPlugin] Error finding commits for ${flag}:`, error);
             }
+        }
+        return commits;
+    }
+    /**
+     * Find historical merged PR commits whose override block contains newly enabled flags.
+     */
+    async findHistoricalOverridePullRequestCommits(flags) {
+        var _a;
+        const latestTag = this.getLatestTag();
+        if (!latestTag) {
+            return [];
+        }
+        const flagSet = new Set(flags);
+        const commitsSinceLatestTag = new Set();
+        try {
+            const revListOutput = (0, child_process_1.execSync)(`git rev-list ${latestTag}..HEAD`, {
+                encoding: 'utf-8',
+                stdio: ['pipe', 'pipe', 'ignore'],
+            });
+            for (const sha of revListOutput
+                .split('\n')
+                .map(line => line.trim())
+                .filter(Boolean)) {
+                commitsSinceLatestTag.add(sha);
+            }
+        }
+        catch (_b) {
+            return [];
+        }
+        const commits = [];
+        try {
+            for await (const pr of this.github.pullRequestIterator(this.targetBranch, 'MERGED', 500, false)) {
+                const mergeSha = pr.mergeCommitOid || pr.sha;
+                if (!mergeSha || !commitsSinceLatestTag.has(mergeSha)) {
+                    continue;
+                }
+                const overrideMessage = this.extractOverrideMessage(pr.body || '');
+                if (!overrideMessage) {
+                    continue;
+                }
+                const flagMatch = overrideMessage.match(/Feature-Flag:\s*(\w+)/i);
+                if (!flagMatch || !flagSet.has(flagMatch[1])) {
+                    continue;
+                }
+                const effectiveSubject = (_a = overrideMessage
+                    .split('\n')
+                    .find(line => line.trim().length > 0)) === null || _a === void 0 ? void 0 : _a.trim();
+                if (!effectiveSubject) {
+                    continue;
+                }
+                commits.push({
+                    sha: mergeSha,
+                    message: overrideMessage,
+                    files: pr.files || [],
+                    pullRequest: {
+                        ...pr,
+                        sha: mergeSha,
+                    },
+                    type: this.extractCommitType(effectiveSubject),
+                    scope: this.extractCommitScope(effectiveSubject),
+                    bareMessage: effectiveSubject,
+                    notes: [],
+                    references: [],
+                    breaking: false,
+                });
+                console.log(`[FeatureFlagPlugin] Found historical PR override commit ${mergeSha.substring(0, 7)} for ${flagMatch[1]} (PR #${pr.number})`);
+            }
+        }
+        catch (_c) {
+            return commits;
         }
         return commits;
     }

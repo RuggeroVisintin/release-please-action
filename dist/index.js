@@ -50339,7 +50339,7 @@ class FeatureFlagPlugin extends plugin_1.ManifestPlugin {
             return true;
         }
         const flag = flagMatch[1];
-        const isEnabled = this.enabledFlags.has(flag);
+        const isEnabled = this.enabledFlags.has(flag) || this.enabledFlags.has(`FEATURE_${flag}`);
         console.log(`[FeatureFlagPlugin] Commit ${(_a = commit.sha) === null || _a === void 0 ? void 0 : _a.substring(0, 7)}: Feature-Flag=${flag}, enabled=${isEnabled}`);
         return isEnabled;
     }
